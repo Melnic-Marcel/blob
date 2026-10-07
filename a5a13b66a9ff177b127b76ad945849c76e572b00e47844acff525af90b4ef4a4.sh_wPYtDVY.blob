@@ -1,0 +1,2577 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Runtime.CompilerServices;
+using System.Security.Cryptography;
+using System.Text;
+using BepInEx;
+using BepInEx.Configuration;
+using BepInEx.Logging;
+using HarmonyLib;
+using Newtonsoft.Json;
+using UnityEngine;
+using UnityEngine.EventSystems;
+using UnityEngine.Events;
+using UnityEngine.UI;
+
+[assembly: CompilationRelaxations(8)]
+[assembly: RuntimeCompatibility(WrapNonExceptionThrows = true)]
+[assembly: Debuggable(DebuggableAttribute.DebuggingModes.IgnoreSymbolStoreSequencePoints)]
+[assembly: AssemblyTitle("Noctyra Item Upgrader")]
+[assembly: AssemblyDescription("Local item exchange roulette for Valheim")]
+[assembly: AssemblyFileVersion("0.2.0.0")]
+[assembly: AssemblyVersion("0.2.0.0")]
+namespace Noctyra.ItemUpgrader;
+
+public static class GridWindow
+{
+	public static int PoolSize(double viewport, double rowStride, int columns)
+	{
+		return ((int)Math.Ceiling(viewport / rowStride) + 2) * columns;
+	}
+
+	public static int FirstIndex(double offset, double rowStride, int columns, int count)
+	{
+		int val = Math.Max(0, (int)Math.Floor(Math.Max(0.0, offset - 8.0) / rowStride) - 1);
+		int val2 = Math.Max(0, (count + columns - 1) / columns - 1);
+		return Math.Min(val, val2) * columns;
+	}
+
+	public static double ContentHeight(int count, int columns, double cellHeight, double gap)
+	{
+		if (count != 0)
+		{
+			return 16.0 + Math.Ceiling((double)count / (double)columns) * (cellHeight + gap) - gap;
+		}
+		return 16.0;
+	}
+}
+public sealed class RewardReceipt
+{
+	public string Prefab;
+
+	public int Amount = 1;
+
+	public int Quality = 1;
+
+	public string Transaction;
+}
+[BepInPlugin("noctyra.valheim.itemupgrader", "Noctyra Item Upgrader", "0.2.0")]
+public sealed class Plugin : BaseUnityPlugin
+{
+	public const string Guid = "noctyra.valheim.itemupgrader";
+
+	public const string Version = "0.2.0";
+
+	private const string ReceiptKey = "noctyra.valheim.itemupgrader.pendingReward.v1";
+
+	public static Plugin Instance;
+
+	private static int closedFrame = -1;
+
+	private ConfigEntry<KeyboardShortcut> hotkey;
+
+	private ConfigEntry<bool> modEnabled;
+
+	private ConfigEntry<double> returnRate;
+
+	private ConfigEntry<double> maxChance;
+
+	private ConfigEntry<double> craftingMarkup;
+
+	private ConfigEntry<float> spinSeconds;
+
+	private ConfigEntry<int> maximumRewardAmount;
+
+	private Harmony harmony;
+
+	private UpgraderUI ui;
+
+	private Player player;
+
+	private float refreshTime;
+
+	private bool initialized;
+
+	private bool invalidReceipt;
+
+	private string catalogError;
+
+	private RewardReceipt pending;
+
+	private float spinStart;
+
+	private float spinDuration;
+
+	private double spinAngle;
+
+	private double spinEndAngle;
+
+	private double spinChance;
+
+	private bool spinWin;
+
+	private string spinTarget;
+
+	public static bool IsOpen
+	{
+		get
+		{
+			if ((Object)(object)Instance != (Object)null && Instance.ui != null)
+			{
+				return Instance.ui.Visible;
+			}
+			return false;
+		}
+	}
+
+	public static bool BlocksInput
+	{
+		get
+		{
+			if (!IsOpen)
+			{
+				return Time.frameCount == closedFrame;
+			}
+			return true;
+		}
+	}
+
+	public ValueCatalog Catalog { get; private set; }
+
+	public ItemData Source { get; private set; }
+
+	public CatalogItem Target { get; private set; }
+
+	public int Quantity { get; private set; }
+
+	public int TargetQuantity { get; private set; }
+
+	public int RewardRemaining
+	{
+		get
+		{
+			if (pending != null)
+			{
+				return pending.Amount;
+			}
+			return 0;
+		}
+	}
+
+	public int MaximumRewardAmount => maximumRewardAmount.Value;
+
+	public bool Spinning { get; private set; }
+
+	public string Status { get; private set; }
+
+	public bool HasReward => pending != null;
+
+	public CatalogItem RewardItem
+	{
+		get
+		{
+			if (pending != null && Catalog != null)
+			{
+				return Catalog.Find(pending.Prefab);
+			}
+			return null;
+		}
+	}
+
+	public Player LocalPlayer => player;
+
+	public string HotkeyLabel => ((object)hotkey.Value/*cast due to .constrained prefix*/).ToString();
+
+	public double Stake
+	{
+		get
+		{
+			if (Catalog != null)
+			{
+				return Catalog.StakeValue(Source, Quantity);
+			}
+			return 0.0;
+		}
+	}
+
+	public double TargetTotal
+	{
+		get
+		{
+			if (Target != null)
+			{
+				return RollMath.TargetValue(Target.Value, TargetQuantity);
+			}
+			return 0.0;
+		}
+	}
+
+	public double Chance => RollMath.Chance(Stake, TargetTotal, returnRate.Value, maxChance.Value);
+
+	public double DisplayChance
+	{
+		get
+		{
+			if (!Spinning && (Source != null || !(spinAngle > 0.0)))
+			{
+				return Chance;
+			}
+			return spinChance;
+		}
+	}
+
+	public bool CanChangeSelection
+	{
+		get
+		{
+			if (!Spinning && !HasReward)
+			{
+				return !invalidReceipt;
+			}
+			return false;
+		}
+	}
+
+	public static void JustClosed()
+	{
+		closedFrame = Time.frameCount;
+	}
+
+	private void Awake()
+	{
+		//IL_0042: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0091: Unknown result type (might be due to invalid IL or missing references)
+		//IL_009b: Expected O, but got Unknown
+		//IL_00db: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00e5: Expected O, but got Unknown
+		//IL_0125: Unknown result type (might be due to invalid IL or missing references)
+		//IL_012f: Expected O, but got Unknown
+		//IL_0163: Unknown result type (might be due to invalid IL or missing references)
+		//IL_016d: Expected O, but got Unknown
+		//IL_019d: Unknown result type (might be due to invalid IL or missing references)
+		//IL_01a7: Expected O, but got Unknown
+		//IL_01ff: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0209: Expected O, but got Unknown
+		//IL_024d: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0252: Unknown result type (might be due to invalid IL or missing references)
+		Instance = this;
+		modEnabled = ((BaseUnityPlugin)this).Config.Bind<bool>("General", "Enabled", true, "Enable the local upgrader UI.");
+		hotkey = ((BaseUnityPlugin)this).Config.Bind<KeyboardShortcut>("General", "OpenKey", new KeyboardShortcut((KeyCode)289, Array.Empty<KeyCode>()), "Key for opening and closing the upgrader.");
+		returnRate = ((BaseUnityPlugin)this).Config.Bind<double>("Balance", "ReturnRate", 0.9, new ConfigDescription("Chance = stake value / target value * ReturnRate. No artificial minimum chance.", (AcceptableValueBase)(object)new AcceptableValueRange<double>(0.01, 1.0), Array.Empty<object>()));
+		maxChance = ((BaseUnityPlugin)this).Config.Bind<double>("Balance", "MaximumChance", 0.95, new ConfigDescription("Maximum probability: 0.95 means 95%.", (AcceptableValueBase)(object)new AcceptableValueRange<double>(0.01, 1.0), Array.Empty<object>()));
+		craftingMarkup = ((BaseUnityPlugin)this).Config.Bind<double>("Balance", "CraftingMarkup", 1.15, new ConfigDescription("Labor multiplier for automatically valued recipes. Existing ItemValues.json entries take precedence.", (AcceptableValueBase)(object)new AcceptableValueRange<double>(1.0, 3.0), Array.Empty<object>()));
+		spinSeconds = ((BaseUnityPlugin)this).Config.Bind<float>("Visual", "SpinSeconds", 5f, new ConfigDescription("Wheel animation duration in seconds.", (AcceptableValueBase)(object)new AcceptableValueRange<float>(1f, 10f), Array.Empty<object>()));
+		maximumRewardAmount = ((BaseUnityPlugin)this).Config.Bind<int>("Balance", "MaximumRewardAmount", 1000, new ConfigDescription("Maximum selected reward quantity. Larger rewards can be claimed in several batches.", (AcceptableValueBase)(object)new AcceptableValueRange<int>(1, 10000), Array.Empty<object>()));
+		ConfigEntry<string> val = ((BaseUnityPlugin)this).Config.Bind<string>("Internal", "AnimationVersion", "", "Tracks the one-time migration to the five-second animation.");
+		if (val.Value != "0.2.0")
+		{
+			spinSeconds.Value = 5f;
+			val.Value = "0.2.0";
+		}
+		harmony = new Harmony("noctyra.valheim.itemupgrader");
+		harmony.PatchAll(typeof(Plugin).Assembly);
+		Status = "Выбери ставку и желаемый предмет.";
+		Quantity = 1;
+		TargetQuantity = 1;
+		((BaseUnityPlugin)this).Logger.LogInfo((object)("Noctyra Item Upgrader 0.2.0 loaded. Local only. Open with " + ((object)hotkey.Value/*cast due to .constrained prefix*/).ToString() + "."));
+	}
+
+	private void Update()
+	{
+		//IL_01ba: Unknown result type (might be due to invalid IL or missing references)
+		//IL_01bf: Unknown result type (might be due to invalid IL or missing references)
+		Player localPlayer = Player.m_localPlayer;
+		if ((Object)(object)localPlayer != (Object)(object)player)
+		{
+			if (ui != null)
+			{
+				ui.Destroy();
+			}
+			ui = null;
+			player = localPlayer;
+			Source = null;
+			Target = null;
+			Quantity = 1;
+			TargetQuantity = 1;
+			Spinning = false;
+			pending = null;
+			invalidReceipt = false;
+			spinAngle = 0.0;
+			initialized = false;
+			Catalog = null;
+			catalogError = null;
+		}
+		if ((Object)(object)player == (Object)null)
+		{
+			return;
+		}
+		if (!modEnabled.Value)
+		{
+			if (ui != null && ui.Visible)
+			{
+				ui.Hide();
+			}
+			return;
+		}
+		if (!initialized && (Object)(object)ObjectDB.instance != (Object)null && ObjectDB.instance.m_items.Count > 0 && ObjectDB.instance.m_recipes.Count > 0 && !((Character)player).InCutscene())
+		{
+			Initialize();
+		}
+		if (!initialized)
+		{
+			return;
+		}
+		if (Spinning)
+		{
+			float num = Mathf.Clamp01((Time.unscaledTime - spinStart) / spinDuration);
+			if (ui != null)
+			{
+				ui.SetAngle((float)(spinAngle * RollMath.SmoothSpin(num)));
+			}
+			if (num >= 1f)
+			{
+				if (ui != null)
+				{
+					ui.SetAngle((float)spinEndAngle);
+				}
+				CompleteSpin();
+			}
+		}
+		if (ui != null && ui.Visible && ((Character)player).IsDead())
+		{
+			ui.Hide();
+		}
+		KeyboardShortcut value = hotkey.Value;
+		if (((KeyboardShortcut)(ref value)).IsDown())
+		{
+			if (ui != null && ui.Visible)
+			{
+				ui.Hide();
+			}
+			else if (!((Character)player).IsDead() && !((Character)player).InCutscene() && !InventoryGui.IsVisible() && !Menu.IsVisible() && (!((Object)(object)Chat.instance != (Object)null) || !Chat.instance.HasFocus()))
+			{
+				Open();
+			}
+		}
+		if (ui == null || !ui.Visible)
+		{
+			return;
+		}
+		if (Input.GetKeyDown((KeyCode)27))
+		{
+			ui.Hide();
+			return;
+		}
+		Cursor.lockState = (CursorLockMode)0;
+		Cursor.visible = true;
+		if (Time.unscaledTime > refreshTime)
+		{
+			refreshTime = Time.unscaledTime + 0.35f;
+			ValidateSource();
+			ui.Refresh(force: false);
+		}
+	}
+
+	private void Initialize()
+	{
+		try
+		{
+			Catalog = new ValueCatalog(Path.Combine(Paths.ConfigPath, "ItemUpgrader"), craftingMarkup.Value, ((BaseUnityPlugin)this).Logger);
+			Catalog.Build();
+			LoadReceipt();
+			initialized = true;
+			Status = (invalidReceipt ? "Ошибка сохранённой награды. Пришли LogOutput.log для исправления." : ((pending == null) ? "Выбери ставку и желаемый предмет." : "Есть сохранённый выигрыш. Нажми «Забрать»."));
+			((MonoBehaviour)this).StartCoroutine(PrewarmUi(player));
+		}
+		catch (Exception ex)
+		{
+			initialized = true;
+			Catalog = null;
+			catalogError = "Ошибка таблицы ценностей. Проверь ItemValues.json и LogOutput.log.";
+			((BaseUnityPlugin)this).Logger.LogError((object)("ItemUpgrader initialization failed: " + ex));
+		}
+	}
+
+	private IEnumerator PrewarmUi(Player owner)
+	{
+		yield return null;
+		if ((Object)(object)player != (Object)(object)owner || Catalog == null)
+		{
+			yield break;
+		}
+		try
+		{
+			if (ui == null)
+			{
+				ui = new UpgraderUI(this);
+			}
+		}
+		catch (Exception ex)
+		{
+			((BaseUnityPlugin)this).Logger.LogError((object)("UI prewarm failed: " + ex));
+			yield break;
+		}
+		UpgraderUI prepared = ui;
+		IEnumerator steps = prepared.Prewarm();
+		while ((Object)(object)player == (Object)(object)owner && ui == prepared && steps.MoveNext())
+		{
+			yield return steps.Current;
+		}
+	}
+
+	private void Open()
+	{
+		if (Catalog == null)
+		{
+			((Character)player).Message((MessageType)2, catalogError ?? "Каталог ещё не готов.", 0, (Sprite)null, false);
+			return;
+		}
+		try
+		{
+			if (ui == null)
+			{
+				ui = new UpgraderUI(this);
+			}
+			ValidateSource();
+			ui.Show();
+		}
+		catch (Exception ex)
+		{
+			if (ui != null)
+			{
+				ui.Destroy();
+			}
+			ui = null;
+			((BaseUnityPlugin)this).Logger.LogError((object)("Could not create upgrader UI: " + ex));
+			((Character)player).Message((MessageType)2, "Не удалось открыть меню. Пришли LogOutput.log.", 0, (Sprite)null, false);
+		}
+	}
+
+	public void SelectSource(ItemData item)
+	{
+		if (CanChangeSelection && item != null && ((Humanoid)player).GetInventory().ContainsItem(item))
+		{
+			if (item.m_equipped)
+			{
+				SetStatus("Сначала сними этот предмет с персонажа.");
+				return;
+			}
+			if (Catalog.Find(item) == null)
+			{
+				SetStatus("Для этого предмета обмен отключён.");
+				return;
+			}
+			Source = item;
+			Quantity = 1;
+			spinAngle = 0.0;
+			ui.ResetWheel();
+			Status = "Ставка выбрана. Выбери желаемый предмет справа.";
+			ui.Refresh(force: true);
+		}
+	}
+
+	public void SelectTarget(CatalogItem target)
+	{
+		if (CanChangeSelection && target != null)
+		{
+			Target = target;
+			TargetQuantity = 1;
+			spinAngle = 0.0;
+			Status = "При проигрыше выбранное количество ставки исчезнет.";
+			ui.ResetWheel();
+			ui.Refresh(force: true);
+		}
+	}
+
+	public void SetQuantity(int quantity)
+	{
+		if (CanChangeSelection && Source != null)
+		{
+			Quantity = Math.Max(1, Math.Min(Source.m_stack, quantity));
+			ui.Refresh(force: false);
+		}
+	}
+
+	public void SetTargetQuantity(int quantity)
+	{
+		if (CanChangeSelection && Target != null)
+		{
+			TargetQuantity = Math.Max(1, Math.Min(MaximumRewardAmount, quantity));
+			spinAngle = 0.0;
+			if (ui != null)
+			{
+				ui.ResetWheel();
+				ui.Refresh(force: false);
+			}
+		}
+	}
+
+	public void ClearSource()
+	{
+		if (CanChangeSelection)
+		{
+			Source = null;
+			Quantity = 1;
+			spinAngle = 0.0;
+			ui.ResetWheel();
+			ui.Refresh(force: true);
+		}
+	}
+
+	private void ValidateSource()
+	{
+		if (Source != null)
+		{
+			if ((Object)(object)player == (Object)null || !((Humanoid)player).GetInventory().ContainsItem(Source) || Source.m_equipped || Source.m_stack < 1)
+			{
+				Source = null;
+				Quantity = 1;
+			}
+			else
+			{
+				Quantity = Math.Min(Quantity, Source.m_stack);
+			}
+		}
+	}
+
+	public bool CanRoll()
+	{
+		ValidateSource();
+		if (modEnabled.Value && (Object)(object)player != (Object)null && !((Character)player).IsDead() && CanChangeSelection && Source != null && Target != null && Quantity >= 1)
+		{
+			return Chance > 0.0;
+		}
+		return false;
+	}
+
+	public void Roll()
+	{
+		if (!CanRoll())
+		{
+			return;
+		}
+		Inventory inventory = ((Humanoid)player).GetInventory();
+		if (!inventory.ContainsItem(Source) || Source.m_stack < Quantity || Source.m_equipped)
+		{
+			SetStatus("Ставка изменилась. Выбери предмет заново.");
+			return;
+		}
+		if ((Object)(object)ObjectDB.instance.GetItemPrefab(Target.Id) == (Object)null)
+		{
+			SetStatus("Желаемый предмет недоступен.");
+			return;
+		}
+		double sample = UniformSample();
+		double chance = Chance;
+		bool flag = RollMath.Wins(sample, chance);
+		string text = System.Guid.NewGuid().ToString("N");
+		RewardReceipt rewardReceipt = (flag ? new RewardReceipt
+		{
+			Prefab = Target.Id,
+			Amount = TargetQuantity,
+			Quality = 1,
+			Transaction = text
+		} : null);
+		string value = (flag ? JsonConvert.SerializeObject((object)rewardReceipt) : null);
+		string name = ((Object)Source.m_dropPrefab).name;
+		int quantity = Quantity;
+		double stake = Stake;
+		if (!inventory.RemoveItem(Source, quantity))
+		{
+			SetStatus("Не удалось списать ставку. Попытка отменена.");
+			return;
+		}
+		pending = rewardReceipt;
+		if (flag)
+		{
+			player.m_customData["noctyra.valheim.itemupgrader.pendingReward.v1"] = value;
+		}
+		else
+		{
+			player.m_customData.Remove("noctyra.valheim.itemupgrader.pendingReward.v1");
+		}
+		spinChance = chance;
+		spinWin = flag;
+		spinTarget = Target.Name + " × " + TargetQuantity;
+		spinEndAngle = RollMath.EndAngle(sample);
+		spinAngle = 2160.0 + spinEndAngle;
+		spinStart = Time.unscaledTime;
+		spinDuration = spinSeconds.Value;
+		Spinning = true;
+		Source = null;
+		Quantity = 1;
+		Status = "Колесо вращается…";
+		((BaseUnityPlugin)this).Logger.LogInfo((object)("Upgrade " + text + ": " + name + " x" + quantity + " (" + stake.ToString("0.####", CultureInfo.InvariantCulture) + ") -> " + Target.Id + " x" + TargetQuantity + "; chance=" + RollMath.Percent(chance) + "; success=" + flag));
+		if (ui != null)
+		{
+			ui.SetAngle(0f);
+			ui.Refresh(force: true);
+		}
+	}
+
+	private void CompleteSpin()
+	{
+		Spinning = false;
+		Status = (spinWin ? ("УСПЕХ! «" + spinTarget + "» ждёт в ячейке результата.") : "Не повезло. Ставка сгорела. Можно попробовать снова.");
+		if (ui != null)
+		{
+			ui.ShowResult(spinWin);
+			ui.Refresh(force: true);
+		}
+	}
+
+	public void Claim()
+	{
+		if (Spinning || pending == null || (Object)(object)player == (Object)null || ((Character)player).IsDead())
+		{
+			return;
+		}
+		if (pending.Amount < 1 || pending.Amount > 100000 || pending.Quality != 1)
+		{
+			SetStatus("Некорректная сохранённая награда. Пришли лог.");
+			return;
+		}
+		GameObject itemPrefab = ObjectDB.instance.GetItemPrefab(pending.Prefab);
+		ItemDrop val = (((Object)(object)itemPrefab == (Object)null) ? null : itemPrefab.GetComponent<ItemDrop>());
+		if ((Object)(object)val == (Object)null)
+		{
+			SetStatus("Предмет награды отсутствует. Награда сохранена до его возвращения.");
+			return;
+		}
+		Inventory inventory = ((Humanoid)player).GetInventory();
+		int num = 0;
+		while (pending.Amount > 0)
+		{
+			ItemData val2 = val.m_itemData.Clone();
+			val2.m_dropPrefab = itemPrefab;
+			val2.m_quality = 1;
+			val2.m_equipped = false;
+			val2.m_durability = val2.GetMaxDurability();
+			int num2 = Math.Max(1, val2.m_shared.m_maxStackSize);
+			long num3 = (long)Math.Max(0, inventory.GetWidth() * inventory.GetHeight() - inventory.GetAllItems().Count) * (long)num2;
+			foreach (ItemData allItem in inventory.GetAllItems())
+			{
+				if (allItem.m_shared.m_name == val2.m_shared.m_name && allItem.m_quality == 1 && allItem.m_worldLevel == val2.m_worldLevel)
+				{
+					num3 += Math.Max(0, num2 - allItem.m_stack);
+				}
+			}
+			int num4 = (int)Math.Min(pending.Amount, Math.Min(num2, num3));
+			if (num4 < 1 || !inventory.CanAddItem(val2, num4))
+			{
+				break;
+			}
+			val2.m_stack = num4;
+			bool num5 = inventory.AddItem(val2);
+			int num6 = (num5 ? num4 : Math.Max(0, num4 - val2.m_stack));
+			pending.Amount -= num6;
+			num += num6;
+			if (!num5)
+			{
+				break;
+			}
+		}
+		if (pending.Amount == 0)
+		{
+			player.m_customData.Remove("noctyra.valheim.itemupgrader.pendingReward.v1");
+			pending = null;
+		}
+		else
+		{
+			player.m_customData["noctyra.valheim.itemupgrader.pendingReward.v1"] = JsonConvert.SerializeObject((object)pending);
+		}
+		Status = ((num == 0) ? "Нет места. Освободи ячейки и нажми «Забрать»." : ((pending == null) ? ("Получено: " + num + " шт. Выбирай следующую ставку.") : ("Получено: " + num + " шт. Осталось забрать: " + pending.Amount + ".")));
+		if (ui != null)
+		{
+			ui.Refresh(force: true);
+		}
+	}
+
+	public void ReloadValues()
+	{
+		if (Spinning)
+		{
+			return;
+		}
+		try
+		{
+			string id = ((Target == null) ? null : Target.Id);
+			ValueCatalog valueCatalog = new ValueCatalog(Path.Combine(Paths.ConfigPath, "ItemUpgrader"), craftingMarkup.Value, ((BaseUnityPlugin)this).Logger);
+			valueCatalog.Build();
+			Catalog = valueCatalog;
+			Target = Catalog.Find(id);
+			if (ui != null)
+			{
+				ui.RefreshCatalog();
+			}
+			SetStatus("Ценности перечитаны из ItemValues.json.");
+		}
+		catch (Exception ex)
+		{
+			((BaseUnityPlugin)this).Logger.LogError((object)("Price reload failed: " + ex));
+			SetStatus("Ошибка JSON. Предыдущие цены сохранены.");
+		}
+	}
+
+	private void LoadReceipt()
+	{
+		if (!player.m_customData.TryGetValue("noctyra.valheim.itemupgrader.pendingReward.v1", out var value))
+		{
+			return;
+		}
+		try
+		{
+			RewardReceipt rewardReceipt = JsonConvert.DeserializeObject<RewardReceipt>(value);
+			if (rewardReceipt == null || string.IsNullOrEmpty(rewardReceipt.Prefab) || rewardReceipt.Amount < 1 || rewardReceipt.Amount > 100000 || rewardReceipt.Quality != 1)
+			{
+				throw new InvalidDataException("Invalid reward receipt");
+			}
+			pending = rewardReceipt;
+		}
+		catch (Exception ex)
+		{
+			invalidReceipt = true;
+			((BaseUnityPlugin)this).Logger.LogError((object)("Pending reward data is invalid; further rolls blocked: " + ex));
+		}
+	}
+
+	private static double UniformSample()
+	{
+		byte[] array = new byte[8];
+		using (RandomNumberGenerator randomNumberGenerator = RandomNumberGenerator.Create())
+		{
+			randomNumberGenerator.GetBytes(array);
+		}
+		return (double)(BitConverter.ToUInt64(array, 0) >> 11) * 1.1102230246251565E-16;
+	}
+
+	public void SetStatus(string text)
+	{
+		Status = text;
+		if (ui != null)
+		{
+			ui.Refresh(force: false);
+		}
+	}
+
+	private void OnDestroy()
+	{
+		if (ui != null)
+		{
+			ui.Destroy();
+		}
+		if (harmony != null)
+		{
+			harmony.UnpatchSelf();
+		}
+		if ((Object)(object)Instance == (Object)(object)this)
+		{
+			Instance = null;
+		}
+	}
+}
+[HarmonyPatch(typeof(Player), "TakeInput")]
+internal static class PlayerInputPatch
+{
+	private static bool Prefix(ref bool __result)
+	{
+		if (!Plugin.BlocksInput)
+		{
+			return true;
+		}
+		__result = false;
+		return false;
+	}
+}
+[HarmonyPatch(typeof(InventoryGui), "IsVisible")]
+internal static class InventoryVisiblePatch
+{
+	private static void Postfix(ref bool __result)
+	{
+		if (Plugin.BlocksInput)
+		{
+			__result = true;
+		}
+	}
+}
+[HarmonyPatch(typeof(GameCamera), "UpdateMouseCapture")]
+internal static class CursorPatch
+{
+	private static void Postfix()
+	{
+		if (Plugin.IsOpen)
+		{
+			Cursor.lockState = (CursorLockMode)0;
+			Cursor.visible = true;
+		}
+	}
+}
+[HarmonyPatch(typeof(Menu), "Update")]
+internal static class MenuPatch
+{
+	private static bool Prefix()
+	{
+		return !Plugin.BlocksInput;
+	}
+}
+public static class RollMath
+{
+	public static double Chance(double stake, double target, double returnRate, double maximum)
+	{
+		if (!FinitePositive(stake) || !FinitePositive(target))
+		{
+			return 0.0;
+		}
+		if (!FinitePositive(returnRate) || !FinitePositive(maximum))
+		{
+			return 0.0;
+		}
+		return Math.Min(Math.Min(maximum, 1.0), stake / target * Math.Min(returnRate, 1.0));
+	}
+
+	public static bool FinitePositive(double value)
+	{
+		if (value > 0.0 && !double.IsInfinity(value))
+		{
+			return !double.IsNaN(value);
+		}
+		return false;
+	}
+
+	public static bool Wins(double sample, double chance)
+	{
+		if (sample >= 0.0 && sample < 1.0)
+		{
+			return sample < chance;
+		}
+		return false;
+	}
+
+	public static double EndAngle(double sample)
+	{
+		return sample * 360.0;
+	}
+
+	public static double TargetValue(double unitValue, int amount)
+	{
+		if (amount <= 0 || !FinitePositive(unitValue))
+		{
+			return 0.0;
+		}
+		return unitValue * (double)amount;
+	}
+
+	public static double SmoothSpin(double t)
+	{
+		t = Math.Max(0.0, Math.Min(1.0, t));
+		if (t < 0.12)
+		{
+			return 0.5 * (t - 3.0 / (25.0 * Math.PI) * Math.Sin(Math.PI * t / 0.12)) / 0.62;
+		}
+		double num = 0.06;
+		if (t < 0.36)
+		{
+			return (num + t - 0.12) / 0.62;
+		}
+		double num2 = t - 0.36;
+		double num3 = 0.64;
+		return (num + 0.36 - 0.12 + 0.5 * (num2 + num3 / Math.PI * Math.Sin(Math.PI * num2 / num3))) / 0.62;
+	}
+
+	public static string Percent(double chance)
+	{
+		double num = chance * 100.0;
+		if (num >= 0.01)
+		{
+			return num.ToString("0.00", CultureInfo.InvariantCulture) + "%";
+		}
+		if (num > 0.0)
+		{
+			return num.ToString("0.########", CultureInfo.InvariantCulture) + "%";
+		}
+		return "0%";
+	}
+}
+public sealed class UpgraderUI
+{
+	private sealed class CardView
+	{
+		public RectTransform Root;
+
+		public Image Icon;
+
+		public Image Background;
+
+		public FrameGraphic Frame;
+
+		public Button Button;
+
+		public Text First;
+
+		public Text Second;
+
+		public CatalogItem Entry;
+
+		public ItemData Item;
+
+		public string Tooltip;
+
+		public int Index = -1;
+
+		public void SetSelected(bool selected)
+		{
+			//IL_0024: Unknown result type (might be due to invalid IL or missing references)
+			//IL_0009: Unknown result type (might be due to invalid IL or missing references)
+			//IL_003e: Unknown result type (might be due to invalid IL or missing references)
+			//IL_0037: Unknown result type (might be due to invalid IL or missing references)
+			((Graphic)Background).color = (Color)(selected ? new Color(0.3f, 0.22f, 0.11f, 1f) : Card);
+			((Graphic)Frame).color = (selected ? Gold : Border);
+		}
+	}
+
+	private readonly Plugin plugin;
+
+	private GameObject root;
+
+	private RectTransform panel;
+
+	private RectTransform needle;
+
+	private Font font;
+
+	private WheelGraphic wheel;
+
+	private Text sourceName;
+
+	private Text sourceValue;
+
+	private Text sourceQty;
+
+	private Text targetName;
+
+	private Text targetValue;
+
+	private Text targetQuality;
+
+	private Text percent;
+
+	private Text status;
+
+	private Text footer;
+
+	private Text catalogCount;
+
+	private Image sourceIcon;
+
+	private Image targetIcon;
+
+	private Button roll;
+
+	private Button claim;
+
+	private Button minus;
+
+	private Button plus;
+
+	private Button all;
+
+	private Button clear;
+
+	private Button reload;
+
+	private Button category;
+
+	private Button targetMinus;
+
+	private Button targetPlus;
+
+	private Text rollLabel;
+
+	private Text claimLabel;
+
+	private Text categoryLabel;
+
+	private InputField search;
+
+	private InputField targetQuantity;
+
+	private RectTransform targetQuantityGroup;
+
+	private ScrollRect inventoryScroll;
+
+	private ScrollRect catalogScroll;
+
+	private RectTransform inventoryContent;
+
+	private RectTransform catalogContent;
+
+	private readonly List<CardView> inventoryCards = new List<CardView>();
+
+	private readonly List<CardView> targetCards = new List<CardView>();
+
+	private readonly List<CatalogItem> matches = new List<CatalogItem>();
+
+	private List<ItemData> inventoryItems = new List<ItemData>();
+
+	private int inventoryStamp = int.MinValue;
+
+	private bool catalogBound;
+
+	private int filter;
+
+	private bool lastVisible;
+
+	private bool previousCursorVisible;
+
+	private CursorLockMode previousCursorLock;
+
+	private string footerDefault;
+
+	private static readonly Color Background = new Color(0.055f, 0.068f, 0.083f, 0.985f);
+
+	private static readonly Color Card = new Color(0.085f, 0.1f, 0.12f, 1f);
+
+	private static readonly Color Border = new Color(0.29f, 0.26f, 0.19f, 1f);
+
+	private static readonly Color Gold = new Color(0.96f, 0.68f, 0.24f, 1f);
+
+	private static readonly Color TextColor = new Color(0.91f, 0.91f, 0.87f, 1f);
+
+	private static readonly Color Muted = new Color(0.56f, 0.59f, 0.61f, 1f);
+
+	private static readonly Color Green = new Color(0.4f, 0.85f, 0.56f, 1f);
+
+	public bool Visible
+	{
+		get
+		{
+			if ((Object)(object)root != (Object)null)
+			{
+				return root.activeSelf;
+			}
+			return false;
+		}
+	}
+
+	public UpgraderUI(Plugin plugin)
+	{
+		this.plugin = plugin;
+		try
+		{
+			font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
+		}
+		catch
+		{
+		}
+		if ((Object)(object)font == (Object)null)
+		{
+			try
+			{
+				font = Resources.GetBuiltinResource<Font>("Arial.ttf");
+			}
+			catch
+			{
+			}
+		}
+		if ((Object)(object)font == (Object)null)
+		{
+			font = ((IEnumerable<Font>)Resources.FindObjectsOfTypeAll<Font>()).FirstOrDefault((Func<Font, bool>)((Font f) => (Object)(object)f != (Object)null && f.HasCharacter('Я')));
+		}
+		if ((Object)(object)font == (Object)null)
+		{
+			throw new InvalidOperationException("No UI font available");
+		}
+		Build();
+		root.SetActive(false);
+	}
+
+	private void Build()
+	{
+		//IL_0040: Unknown result type (might be due to invalid IL or missing references)
+		//IL_004a: Expected O, but got Unknown
+		//IL_008e: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00cc: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00d7: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00e2: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0100: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0141: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0153: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0189: Unknown result type (might be due to invalid IL or missing references)
+		//IL_01bc: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0218: Unknown result type (might be due to invalid IL or missing references)
+		//IL_02ac: Unknown result type (might be due to invalid IL or missing references)
+		//IL_02d2: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0303: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0336: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0372: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0444: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0498: Unknown result type (might be due to invalid IL or missing references)
+		//IL_052b: Unknown result type (might be due to invalid IL or missing references)
+		root = new GameObject("Noctyra_ItemUpgrader", new Type[4]
+		{
+			typeof(RectTransform),
+			typeof(Canvas),
+			typeof(CanvasScaler),
+			typeof(GraphicRaycaster)
+		});
+		Object.DontDestroyOnLoad((Object)(object)root);
+		Canvas component = root.GetComponent<Canvas>();
+		component.renderMode = (RenderMode)0;
+		component.sortingOrder = 30000;
+		CanvasScaler component2 = root.GetComponent<CanvasScaler>();
+		component2.uiScaleMode = (ScaleMode)1;
+		component2.referenceResolution = new Vector2(1600f, 900f);
+		component2.matchWidthOrHeight = 0.5f;
+		RectTransform obj = Rect(root.transform, "Shade", 0f, 0f, 1600f, 900f);
+		obj.anchorMin = Vector2.zero;
+		obj.anchorMax = Vector2.one;
+		obj.sizeDelta = Vector2.zero;
+		Paint(obj, new Color(0f, 0f, 0f, 0.67f), raycast: true);
+		panel = Rect(root.transform, "Panel", 0f, 0f, 1080f, 820f);
+		Paint(panel, Background, raycast: true);
+		Outline(panel, Border, 2f);
+		Label((Transform)(object)panel, "Title", "УЛУЧШЕНИЕ ПРЕДМЕТОВ", 0f, 374f, 850f, 44f, 27, Gold, (TextAnchor)4);
+		Label((Transform)(object)panel, "Subtitle", "ПОСТАВЬ ПРЕДМЕТ · ВЫБЕРИ ЦЕЛЬ · ИСПЫТАЙ УДАЧУ", 0f, 342f, 850f, 25f, 12, Muted, (TextAnchor)4);
+		Action((Transform)(object)panel, "Close", "×", 505f, 375f, 38f, 38f, delegate
+		{
+			Hide();
+		}, 24);
+		Line((Transform)(object)panel, 0f, 325f, 1016f, Border);
+		BuildSource();
+		BuildTarget();
+		BuildWheel();
+		roll = Action((Transform)(object)panel, "Upgrade", "УЛУЧШИТЬ", 0f, 29f, 350f, 48f, delegate
+		{
+			plugin.Roll();
+		}, 20, accent: true);
+		rollLabel = ((Component)roll).GetComponentInChildren<Text>();
+		status = Label((Transform)(object)panel, "Status", "", 0f, -20f, 1000f, 42f, 14, Muted, (TextAnchor)4);
+		Line((Transform)(object)panel, 0f, -48f, 1016f, Border);
+		Label((Transform)(object)panel, "InventoryTitle", "ТВОЙ ИНВЕНТАРЬ", -265f, -72f, 488f, 30f, 15, Gold, (TextAnchor)3);
+		Label((Transform)(object)panel, "CatalogTitle", "ВЫБЕРИ ЖЕЛАЕМЫЙ ПРЕДМЕТ", 265f, -72f, 488f, 30f, 15, Gold, (TextAnchor)3);
+		inventoryScroll = Scroll((Transform)(object)panel, "Inventory", -265f, -226f, 500f, 272f, out inventoryContent, new Vector2(57f, 66f), 8);
+		search = Search((Transform)(object)panel, 195f, -113f, 356f, 32f);
+		((UnityEvent<string>)(object)search.onValueChanged).AddListener((UnityAction<string>)delegate
+		{
+			RebuildTargets();
+		});
+		category = Action((Transform)(object)panel, "Category", "Все", 450f, -113f, 135f, 32f, CycleCategory, 12);
+		categoryLabel = ((Component)category).GetComponentInChildren<Text>();
+		catalogScroll = Scroll((Transform)(object)panel, "Catalog", 265f, -253f, 500f, 218f, out catalogContent, new Vector2(116f, 92f), 4);
+		((UnityEvent<Vector2>)(object)catalogScroll.onValueChanged).AddListener((UnityAction<Vector2>)delegate
+		{
+			UpdateVisibleTargets();
+		});
+		catalogCount = Label((Transform)(object)panel, "Count", "", 255f, -383f, 180f, 22f, 11, Muted, (TextAnchor)5);
+		reload = Action((Transform)(object)panel, "ReloadPrices", "ОБНОВИТЬ ЦЕНЫ", 447f, -383f, 142f, 27f, delegate
+		{
+			plugin.ReloadValues();
+		}, 10);
+		footerDefault = plugin.HotkeyLabel + " / Esc — закрыть  ·  Выбери ставку слева, затем цель справа";
+		footer = Label((Transform)(object)panel, "Footer", footerDefault, -168f, -383f, 660f, 27f, 11, Muted, (TextAnchor)3);
+	}
+
+	private void BuildSource()
+	{
+		//IL_0026: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0033: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0064: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0092: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00d1: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0104: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0171: Unknown result type (might be due to invalid IL or missing references)
+		RectTransform val = Rect((Transform)(object)panel, "SourceSlot", -350f, 199f, 264f, 246f);
+		Paint(val, Card);
+		Outline(val, Border, 1f);
+		Label((Transform)(object)val, "Caption", "ТВОЯ СТАВКА", 0f, 98f, 240f, 25f, 13, Muted, (TextAnchor)4);
+		RectTransform rect = Rect((Transform)(object)val, "ItemIcon", 0f, 34f, 68f, 68f);
+		sourceIcon = Paint(rect, Color.white);
+		sourceIcon.preserveAspect = true;
+		sourceName = Label((Transform)(object)val, "Name", "Выбери предмет снизу", 0f, -17f, 242f, 42f, 15, TextColor, (TextAnchor)4);
+		sourceValue = Label((Transform)(object)val, "Value", "Ценность: —", 0f, -51f, 240f, 26f, 14, Gold, (TextAnchor)4);
+		minus = Action((Transform)(object)val, "Minus", "−", -92f, -91f, 31f, 31f, delegate
+		{
+			plugin.SetQuantity(plugin.Quantity - 1);
+		}, 18);
+		sourceQty = Label((Transform)(object)val, "Quantity", "× 1", -25f, -91f, 80f, 31f, 15, TextColor, (TextAnchor)4);
+		plus = Action((Transform)(object)val, "Plus", "+", 43f, -91f, 31f, 31f, delegate
+		{
+			plugin.SetQuantity(plugin.Quantity + 1);
+		}, 18);
+		all = Action((Transform)(object)val, "All", "ВСЁ", 92f, -91f, 51f, 31f, delegate
+		{
+			if (plugin.Source != null)
+			{
+				plugin.SetQuantity(plugin.Source.m_stack);
+			}
+		}, 10);
+		clear = Action((Transform)(object)val, "Clear", "×", 108f, 97f, 23f, 23f, delegate
+		{
+			plugin.ClearSource();
+		}, 14);
+	}
+
+	private void BuildTarget()
+	{
+		//IL_0026: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0033: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0064: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0092: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00d1: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0104: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0137: Unknown result type (might be due to invalid IL or missing references)
+		//IL_02a0: Unknown result type (might be due to invalid IL or missing references)
+		RectTransform val = Rect((Transform)(object)panel, "TargetSlot", 350f, 199f, 264f, 246f);
+		Paint(val, Card);
+		Outline(val, Border, 1f);
+		Label((Transform)(object)val, "Caption", "ЖЕЛАЕМЫЙ ПРЕДМЕТ", 0f, 98f, 240f, 25f, 13, Muted, (TextAnchor)4);
+		RectTransform rect = Rect((Transform)(object)val, "ItemIcon", 0f, 43f, 64f, 64f);
+		targetIcon = Paint(rect, Color.white);
+		targetIcon.preserveAspect = true;
+		targetName = Label((Transform)(object)val, "Name", "Выбери цель в каталоге", 0f, -7f, 242f, 34f, 15, TextColor, (TextAnchor)4);
+		targetValue = Label((Transform)(object)val, "Value", "Ценность: —", 0f, -39f, 240f, 24f, 14, Gold, (TextAnchor)4);
+		targetQuality = Label((Transform)(object)val, "Quality", "Качество 1", 0f, -63f, 236f, 18f, 10, Muted, (TextAnchor)4);
+		claim = Action((Transform)(object)val, "Claim", "ЗАБРАТЬ", 0f, -91f, 218f, 31f, delegate
+		{
+			plugin.Claim();
+		}, 13, accent: true);
+		claimLabel = ((Component)claim).GetComponentInChildren<Text>();
+		((Component)claim).gameObject.SetActive(false);
+		targetQuantityGroup = Rect((Transform)(object)val, "QuantityControls", 0f, -91f, 218f, 31f);
+		targetMinus = Action((Transform)(object)targetQuantityGroup, "Minus", "−", -85f, 0f, 31f, 31f, delegate
+		{
+			plugin.SetTargetQuantity(plugin.TargetQuantity - 1);
+		}, 18);
+		targetPlus = Action((Transform)(object)targetQuantityGroup, "Plus", "+", 85f, 0f, 31f, 31f, delegate
+		{
+			plugin.SetTargetQuantity(plugin.TargetQuantity + 1);
+		}, 18);
+		targetQuantity = Search((Transform)(object)targetQuantityGroup, 0f, 0f, 108f, 31f);
+		targetQuantity.contentType = (ContentType)2;
+		targetQuantity.characterLimit = 5;
+		targetQuantity.textComponent.alignment = (TextAnchor)4;
+		((Text)targetQuantity.placeholder).text = "Количество";
+		((UnityEvent<string>)(object)targetQuantity.onValueChanged).AddListener((UnityAction<string>)delegate(string value)
+		{
+			if (int.TryParse(value, out var result) && result > 0)
+			{
+				plugin.SetTargetQuantity(result);
+				if (result > plugin.MaximumRewardAmount)
+				{
+					targetQuantity.SetTextWithoutNotify(plugin.MaximumRewardAmount.ToString());
+				}
+			}
+		});
+		((UnityEvent<string>)(object)targetQuantity.onEndEdit).AddListener((UnityAction<string>)delegate(string value)
+		{
+			plugin.SetTargetQuantity((!int.TryParse(value, out var result)) ? 1 : result);
+			targetQuantity.SetTextWithoutNotify(plugin.TargetQuantity.ToString());
+		});
+	}
+
+	private void BuildWheel()
+	{
+		//IL_0096: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00b4: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00ee: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0121: Unknown result type (might be due to invalid IL or missing references)
+		//IL_014e: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0180: Unknown result type (might be due to invalid IL or missing references)
+		RectTransform val = Rect((Transform)(object)panel, "Wheel", 0f, 185f, 260f, 260f);
+		wheel = ((Component)val).gameObject.AddComponent<WheelGraphic>();
+		((Graphic)wheel).raycastTarget = false;
+		needle = Rect((Transform)(object)val, "Needle", 0f, 0f, 260f, 260f);
+		RectTransform obj = Rect((Transform)(object)needle, "Shaft", 0f, 0f, 2f, 119f);
+		obj.pivot = new Vector2(0.5f, 0f);
+		Paint(obj, new Color(0.96f, 0.91f, 0.73f, 1f));
+		((Graphic)((Component)Rect((Transform)(object)needle, "ArrowTip", 0f, 116f, 16f, 18f)).gameObject.AddComponent<ArrowGraphic>()).color = Gold;
+		((Graphic)((Component)Rect((Transform)(object)val, "Center", 0f, 0f, 156f, 156f)).gameObject.AddComponent<DiskGraphic>()).color = Background;
+		percent = Label((Transform)(object)val, "Percent", "—", 0f, 8f, 154f, 46f, 29, Gold, (TextAnchor)4);
+		Label((Transform)(object)val, "ChanceLabel", "ШАНС УСПЕХА", 0f, -27f, 150f, 25f, 11, Muted, (TextAnchor)4);
+	}
+
+	public void Show()
+	{
+		//IL_0014: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0019: Unknown result type (might be due to invalid IL or missing references)
+		if (!Visible)
+		{
+			previousCursorVisible = Cursor.visible;
+			previousCursorLock = Cursor.lockState;
+			lastVisible = true;
+		}
+		root.SetActive(true);
+		Cursor.lockState = (CursorLockMode)0;
+		Cursor.visible = true;
+		Refresh(force: true);
+	}
+
+	public void Hide()
+	{
+		//IL_0048: Unknown result type (might be due to invalid IL or missing references)
+		if (Visible)
+		{
+			Plugin.JustClosed();
+		}
+		if ((Object)(object)root != (Object)null)
+		{
+			root.SetActive(false);
+		}
+		if ((Object)(object)EventSystem.current != (Object)null)
+		{
+			EventSystem.current.SetSelectedGameObject((GameObject)null);
+		}
+		if (lastVisible)
+		{
+			Cursor.lockState = previousCursorLock;
+			Cursor.visible = previousCursorVisible;
+			lastVisible = false;
+		}
+	}
+
+	public void Destroy()
+	{
+		Hide();
+		if ((Object)(object)root != (Object)null)
+		{
+			Object.Destroy((Object)(object)root);
+		}
+		root = null;
+	}
+
+	public void SetAngle(float degrees)
+	{
+		//IL_0020: Unknown result type (might be due to invalid IL or missing references)
+		if ((Object)(object)needle != (Object)null)
+		{
+			((Transform)needle).localRotation = Quaternion.Euler(0f, 0f, 0f - degrees);
+		}
+	}
+
+	public void ResetWheel()
+	{
+		SetAngle(0f);
+		wheel.ClearResult();
+	}
+
+	public void ShowResult(bool won)
+	{
+		wheel.SetResult(won);
+	}
+
+	public void Refresh(bool force)
+	{
+		//IL_0458: Unknown result type (might be due to invalid IL or missing references)
+		//IL_045f: Unknown result type (might be due to invalid IL or missing references)
+		if (!((Object)(object)root == (Object)null))
+		{
+			ItemData source = plugin.Source;
+			CatalogItem catalogItem = ((plugin.HasReward && !plugin.Spinning) ? plugin.RewardItem : plugin.Target);
+			sourceName.text = ((source == null) ? "Выбери предмет снизу" : (Name(source) + ((source.m_quality > 1) ? ("  ★" + source.m_quality) : "")));
+			sourceValue.text = ((source == null) ? "Ценность: —" : ("Ценность ставки: " + Number(plugin.Stake)));
+			sourceQty.text = "× " + plugin.Quantity;
+			SetIcon(sourceIcon, (source == null) ? null : source.GetIcon());
+			targetName.text = ((catalogItem != null) ? catalogItem.Name : (plugin.HasReward ? "Сохранённая награда" : "Выбери цель в каталоге"));
+			int amount = ((plugin.HasReward && !plugin.Spinning) ? plugin.RewardRemaining : plugin.TargetQuantity);
+			targetValue.text = ((catalogItem == null) ? "Ценность: —" : ("Ценность цели: " + Number(RollMath.TargetValue(catalogItem.Value, amount))));
+			targetQuality.text = ((catalogItem == null) ? "Качество 1" : ("Качество 1 · за 1 шт.: " + Number(catalogItem.Value)));
+			SetIcon(targetIcon, (catalogItem == null) ? null : catalogItem.Template.GetIcon());
+			((Component)claim).gameObject.SetActive(plugin.HasReward && !plugin.Spinning);
+			((Selectable)claim).interactable = plugin.HasReward && !plugin.Spinning;
+			claimLabel.text = "ЗАБРАТЬ × " + plugin.RewardRemaining;
+			((Component)targetQuantityGroup).gameObject.SetActive(!((Component)claim).gameObject.activeSelf);
+			bool canChangeSelection = plugin.CanChangeSelection;
+			((Selectable)targetMinus).interactable = canChangeSelection && plugin.Target != null && plugin.TargetQuantity > 1;
+			((Selectable)targetPlus).interactable = canChangeSelection && plugin.Target != null && plugin.TargetQuantity < plugin.MaximumRewardAmount;
+			((Selectable)targetQuantity).interactable = canChangeSelection && plugin.Target != null;
+			if (!targetQuantity.isFocused)
+			{
+				targetQuantity.SetTextWithoutNotify(plugin.TargetQuantity.ToString());
+			}
+			((Selectable)minus).interactable = canChangeSelection && source != null && plugin.Quantity > 1;
+			((Selectable)plus).interactable = canChangeSelection && source != null && plugin.Quantity < source.m_stack;
+			((Selectable)all).interactable = canChangeSelection && source != null && plugin.Quantity < source.m_stack;
+			((Selectable)clear).interactable = canChangeSelection && source != null;
+			((Selectable)roll).interactable = plugin.CanRoll();
+			rollLabel.text = (plugin.Spinning ? "ВРАЩАЕТСЯ…" : (plugin.HasReward ? "ЗАБЕРИ ВЫИГРЫШ" : "УЛУЧШИТЬ"));
+			((Selectable)reload).interactable = !plugin.Spinning;
+			status.text = plugin.Status;
+			((Graphic)status).color = ((plugin.HasReward && !plugin.Spinning) ? Green : Muted);
+			double displayChance = plugin.DisplayChance;
+			percent.text = ((displayChance <= 0.0) ? "—" : RollMath.Percent(displayChance));
+			if (percent.text.Length > 8)
+			{
+				percent.fontSize = 17;
+			}
+			else
+			{
+				percent.fontSize = 29;
+			}
+			wheel.SetChance((float)displayChance);
+			if (!plugin.Spinning && source != null)
+			{
+				wheel.ClearResult();
+			}
+			RebuildInventory();
+			if (!catalogBound)
+			{
+				RebuildTargets();
+			}
+			else
+			{
+				UpdateVisibleTargets();
+			}
+		}
+	}
+
+	public void RefreshCatalog()
+	{
+		inventoryStamp = int.MinValue;
+		RebuildTargets();
+		Refresh(force: false);
+	}
+
+	public IEnumerator Prewarm()
+	{
+		int targetCount = GridWindow.PoolSize(214.0, 96.0, 4);
+		int inventoryCount = ((Humanoid)plugin.LocalPlayer).GetInventory().GetAllItems().Count;
+		while (targetCards.Count < targetCount)
+		{
+			for (int i = 0; i < 4; i++)
+			{
+				if (targetCards.Count >= targetCount)
+				{
+					break;
+				}
+				targetCards.Add(CreateCard(target: true));
+			}
+			yield return null;
+		}
+		while (inventoryCards.Count < inventoryCount)
+		{
+			for (int j = 0; j < 4; j++)
+			{
+				if (inventoryCards.Count >= inventoryCount)
+				{
+					break;
+				}
+				inventoryCards.Add(CreateCard(target: false));
+			}
+			yield return null;
+		}
+		Refresh(force: false);
+		int[] array = new int[4] { 10, 11, 15, 29 };
+		foreach (int num in array)
+		{
+			font.RequestCharactersInTexture("АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюя0123456789×%—.,:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz", num);
+			yield return null;
+		}
+	}
+
+	private void RebuildInventory()
+	{
+		//IL_0148: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0236: Unknown result type (might be due to invalid IL or missing references)
+		//IL_021b: Unknown result type (might be due to invalid IL or missing references)
+		if ((Object)(object)plugin.LocalPlayer == (Object)null)
+		{
+			return;
+		}
+		List<ItemData> allItems = ((Humanoid)plugin.LocalPlayer).GetInventory().GetAllItems();
+		int num = 17;
+		foreach (ItemData item in allItems)
+		{
+			num = num * 31 + ((object)item).GetHashCode();
+			num = num * 31 + item.m_stack;
+			num = num * 31 + item.m_quality;
+			num = num * 31 + item.m_durability.GetHashCode();
+			num = num * 31 + ((object)Unsafe.As<Vector2i, Vector2i>(ref item.m_gridPos)/*cast due to .constrained prefix*/).GetHashCode();
+			num = num * 31 + (item.m_equipped ? 1 : 0);
+		}
+		if (num != inventoryStamp)
+		{
+			inventoryStamp = num;
+			inventoryItems = (from i in allItems
+				orderby i.m_gridPos.y, i.m_gridPos.x
+				select i).ToList();
+			inventoryContent.sizeDelta = new Vector2(0f, (float)GridWindow.ContentHeight(inventoryItems.Count, 8, 66.0, 4.0));
+		}
+		while (inventoryCards.Count < inventoryItems.Count)
+		{
+			inventoryCards.Add(CreateCard(target: false));
+		}
+		for (int num2 = 0; num2 < inventoryCards.Count; num2++)
+		{
+			CardView cardView = inventoryCards[num2];
+			if (num2 >= inventoryItems.Count)
+			{
+				((Component)cardView.Root).gameObject.SetActive(false);
+				continue;
+			}
+			ItemData val = inventoryItems[num2];
+			((Component)cardView.Root).gameObject.SetActive(true);
+			cardView.Item = val;
+			Position(cardView.Root, num2, 8, 57, 66);
+			cardView.Icon.sprite = val.GetIcon();
+			((Graphic)cardView.Icon).color = (Color)(val.m_equipped ? new Color(0.7f, 0.7f, 0.7f, 1f) : Color.white);
+			cardView.First.text = "×" + val.m_stack;
+			cardView.Second.text = (val.m_equipped ? "●" : "");
+			cardView.Tooltip = Name(val) + "  ·  ценность 1 шт.: " + Number(plugin.Catalog.StakeValue(val, 1)) + (val.m_equipped ? "  ·  сначала сними" : "");
+			((Selectable)cardView.Button).interactable = plugin.CanChangeSelection && !val.m_equipped && plugin.Catalog.Find(val) != null;
+			cardView.SetSelected(plugin.Source == val);
+		}
+	}
+
+	private void CycleCategory()
+	{
+		filter = (filter + 1) % 4;
+		categoryLabel.text = (new string[4] { "Все", "Снаряжение", "Ресурсы", "Еда / зелья" })[filter];
+		catalogScroll.verticalNormalizedPosition = 1f;
+		RebuildTargets();
+	}
+
+	private bool MatchesFilter(CatalogItem entry)
+	{
+		string text = ((object)Unsafe.As<ItemType, ItemType>(ref entry.Template.m_shared.m_itemType)/*cast due to .constrained prefix*/).ToString();
+		if (filter == 1)
+		{
+			if (!text.Contains("Weapon"))
+			{
+				switch (text)
+				{
+				default:
+					return text == "Trinket";
+				case "Bow":
+				case "Shield":
+				case "Helmet":
+				case "Chest":
+				case "Legs":
+				case "Shoulder":
+				case "Utility":
+				case "Tool":
+					break;
+				}
+			}
+			return true;
+		}
+		if (filter == 2)
+		{
+			if (!(text == "Material") && !(text == "Trophy"))
+			{
+				return text == "Misc";
+			}
+			return true;
+		}
+		if (filter == 3)
+		{
+			if (!(text == "Consumable"))
+			{
+				return text == "Fish";
+			}
+			return true;
+		}
+		return true;
+	}
+
+	private void RebuildTargets()
+	{
+		//IL_00f9: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0109: Unknown result type (might be due to invalid IL or missing references)
+		if (plugin.Catalog == null || (Object)(object)catalogContent == (Object)null)
+		{
+			return;
+		}
+		string text = (((Object)(object)search == (Object)null) ? "" : search.text.Trim());
+		matches.Clear();
+		foreach (CatalogItem item in plugin.Catalog.Items)
+		{
+			if (MatchesFilter(item) && (text.Length == 0 || item.Name.IndexOf(text, StringComparison.CurrentCultureIgnoreCase) >= 0 || item.Id.IndexOf(text, StringComparison.OrdinalIgnoreCase) >= 0))
+			{
+				matches.Add(item);
+			}
+		}
+		catalogBound = true;
+		catalogContent.sizeDelta = new Vector2(0f, (float)GridWindow.ContentHeight(matches.Count, 4, 92.0, 4.0));
+		catalogContent.anchoredPosition = Vector2.zero;
+		catalogScroll.StopMovement();
+		int num = GridWindow.PoolSize(214.0, 96.0, 4);
+		while (targetCards.Count < num)
+		{
+			targetCards.Add(CreateCard(target: true));
+		}
+		catalogCount.text = matches.Count + " / " + plugin.Catalog.Items.Count + " предметов";
+		UpdateVisibleTargets();
+	}
+
+	private void UpdateVisibleTargets()
+	{
+		//IL_0006: Unknown result type (might be due to invalid IL or missing references)
+		int num = GridWindow.FirstIndex(catalogContent.anchoredPosition.y, 96.0, 4, matches.Count);
+		for (int i = 0; i < targetCards.Count; i++)
+		{
+			CardView cardView = targetCards[i];
+			int num2 = num + i;
+			if (num2 >= matches.Count)
+			{
+				((Component)cardView.Root).gameObject.SetActive(false);
+				cardView.Entry = null;
+				continue;
+			}
+			CatalogItem catalogItem = matches[num2];
+			((Component)cardView.Root).gameObject.SetActive(true);
+			if (cardView.Index != num2)
+			{
+				Position(cardView.Root, num2, 4, 116, 92);
+				cardView.Index = num2;
+			}
+			if (cardView.Entry != catalogItem)
+			{
+				cardView.Entry = catalogItem;
+				cardView.Icon.sprite = catalogItem.Template.GetIcon();
+				cardView.First.text = catalogItem.Name;
+				cardView.Second.text = Number(catalogItem.Value);
+				cardView.Tooltip = catalogItem.Name + "  ·  " + catalogItem.Id + "  ·  ценность: " + Number(catalogItem.Value);
+			}
+			((Selectable)cardView.Button).interactable = plugin.CanChangeSelection;
+			cardView.SetSelected(plugin.Target == catalogItem);
+		}
+	}
+
+	private CardView CreateCard(bool target)
+	{
+		//IL_00a8: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00ae: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00c9: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00e4: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00ff: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0179: Unknown result type (might be due to invalid IL or missing references)
+		//IL_017e: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0192: Unknown result type (might be due to invalid IL or missing references)
+		//IL_01af: Unknown result type (might be due to invalid IL or missing references)
+		//IL_01b9: Expected O, but got Unknown
+		//IL_0205: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0276: Unknown result type (might be due to invalid IL or missing references)
+		//IL_02f9: Unknown result type (might be due to invalid IL or missing references)
+		//IL_02c0: Unknown result type (might be due to invalid IL or missing references)
+		CardView card = new CardView();
+		card.Root = Rect((Transform)(object)(target ? catalogContent : inventoryContent), target ? "TargetCell" : "InventoryCell", 0f, 0f, target ? 116 : 57, target ? 92 : 66);
+		RectTransform obj = card.Root;
+		RectTransform obj2 = card.Root;
+		Vector2 val = default(Vector2);
+		((Vector2)(ref val))..ctor(0f, 1f);
+		obj2.anchorMax = val;
+		obj.anchorMin = val;
+		card.Root.pivot = new Vector2(0f, 1f);
+		card.Background = Paint(card.Root, Card, raycast: true);
+		Outline(card.Root, Border, 1f);
+		card.Frame = ((Component)((Transform)card.Root).Find("Frame")).GetComponent<FrameGraphic>();
+		card.Button = ((Component)card.Root).gameObject.AddComponent<Button>();
+		((Selectable)card.Button).targetGraphic = (Graphic)(object)card.Background;
+		Navigation navigation = ((Selectable)card.Button).navigation;
+		((Navigation)(ref navigation)).mode = (Mode)0;
+		((Selectable)card.Button).navigation = navigation;
+		((UnityEvent)card.Button.onClick).AddListener((UnityAction)delegate
+		{
+			if (target)
+			{
+				if (card.Entry != null)
+				{
+					plugin.SelectTarget(card.Entry);
+				}
+			}
+			else if (card.Item != null)
+			{
+				plugin.SelectSource(card.Item);
+			}
+		});
+		card.Icon = Paint(Rect((Transform)(object)card.Root, "Icon", 0f, target ? 22 : 8, target ? 30 : 36, target ? 30 : 36), Color.white);
+		card.Icon.preserveAspect = true;
+		card.First = Label((Transform)(object)card.Root, "First", "", 0f, target ? (-10) : (-21), target ? 108 : 54, target ? 32 : 18, 10, TextColor, (TextAnchor)4);
+		card.Second = (target ? Label((Transform)(object)card.Root, "Second", "", 0f, -34f, 108f, 20f, 11, Gold, (TextAnchor)4) : Label((Transform)(object)card.Root, "Equipped", "", 18f, 21f, 16f, 16f, 10, Gold, (TextAnchor)4));
+		ItemTip itemTip = ((Component)card.Root).gameObject.AddComponent<ItemTip>();
+		itemTip.Enter = delegate
+		{
+			//IL_0026: Unknown result type (might be due to invalid IL or missing references)
+			footer.text = card.Tooltip;
+			((Graphic)footer).color = TextColor;
+		};
+		itemTip.Exit = delegate
+		{
+			//IL_0026: Unknown result type (might be due to invalid IL or missing references)
+			footer.text = footerDefault;
+			((Graphic)footer).color = Muted;
+		};
+		((Component)card.Root).gameObject.SetActive(false);
+		return card;
+	}
+
+	private static void Position(RectTransform rect, int index, int columns, int width, int height)
+	{
+		//IL_0017: Unknown result type (might be due to invalid IL or missing references)
+		rect.anchoredPosition = new Vector2((float)(8 + index % columns * (width + 3)), (float)(-8 - index / columns * (height + 4)));
+	}
+
+	private static string Name(ItemData item)
+	{
+		if (Localization.instance != null)
+		{
+			return Localization.instance.Localize(item.m_shared.m_name);
+		}
+		return item.m_shared.m_name;
+	}
+
+	private static string Number(double value)
+	{
+		if (!(value >= 10000.0))
+		{
+			return value.ToString("0.##", CultureInfo.InvariantCulture);
+		}
+		return value.ToString("N0", CultureInfo.InvariantCulture);
+	}
+
+	private static void SetIcon(Image image, Sprite sprite)
+	{
+		image.sprite = sprite;
+		((Behaviour)image).enabled = (Object)(object)sprite != (Object)null;
+	}
+
+	private static RectTransform Rect(Transform parent, string name, float x, float y, float width, float height)
+	{
+		//IL_0014: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0039: Unknown result type (might be due to invalid IL or missing references)
+		//IL_003f: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0050: Unknown result type (might be due to invalid IL or missing references)
+		//IL_005d: Unknown result type (might be due to invalid IL or missing references)
+		//IL_006c: Unknown result type (might be due to invalid IL or missing references)
+		RectTransform component = new GameObject(name, new Type[1] { typeof(RectTransform) }).GetComponent<RectTransform>();
+		((Transform)component).SetParent(parent, false);
+		Vector2 val = default(Vector2);
+		((Vector2)(ref val))..ctor(0.5f, 0.5f);
+		component.anchorMax = val;
+		component.anchorMin = val;
+		component.pivot = new Vector2(0.5f, 0.5f);
+		component.anchoredPosition = new Vector2(x, y);
+		component.sizeDelta = new Vector2(width, height);
+		return component;
+	}
+
+	private static Image Paint(RectTransform rect, Color color, bool raycast = false)
+	{
+		//IL_000c: Unknown result type (might be due to invalid IL or missing references)
+		Image obj = ((Component)rect).gameObject.AddComponent<Image>();
+		((Graphic)obj).color = color;
+		((Graphic)obj).raycastTarget = raycast;
+		return obj;
+	}
+
+	private static void Outline(RectTransform rect, Color color, float thickness)
+	{
+		//IL_0011: Unknown result type (might be due to invalid IL or missing references)
+		//IL_001c: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0036: Unknown result type (might be due to invalid IL or missing references)
+		FrameGraphic frameGraphic = ((Component)Rect((Transform)(object)rect, "Frame", 0f, 0f, rect.sizeDelta.x, rect.sizeDelta.y)).gameObject.AddComponent<FrameGraphic>();
+		((Graphic)frameGraphic).color = color;
+		frameGraphic.Thickness = thickness;
+		((Graphic)frameGraphic).raycastTarget = false;
+	}
+
+	private void Line(Transform parent, float x, float y, float width, Color color)
+	{
+		//IL_0014: Unknown result type (might be due to invalid IL or missing references)
+		Paint(Rect(parent, "Divider", x, y, width, 1f), color);
+	}
+
+	private Text Label(Transform parent, string name, string text, float x, float y, float w, float h, int size, Color color, TextAnchor align)
+	{
+		//IL_0035: Unknown result type (might be due to invalid IL or missing references)
+		//IL_003d: Unknown result type (might be due to invalid IL or missing references)
+		Text obj = ((Component)Rect(parent, name, x, y, w, h)).gameObject.AddComponent<Text>();
+		obj.font = font;
+		obj.text = text;
+		obj.fontSize = size;
+		((Graphic)obj).color = color;
+		obj.alignment = align;
+		((Graphic)obj).raycastTarget = false;
+		obj.supportRichText = false;
+		obj.horizontalOverflow = (HorizontalWrapMode)0;
+		obj.verticalOverflow = (VerticalWrapMode)0;
+		return obj;
+	}
+
+	private Button Action(Transform parent, string name, string text, float x, float y, float w, float h, Action callback, int size, bool accent = false)
+	{
+		//IL_0052: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0037: Unknown result type (might be due to invalid IL or missing references)
+		//IL_006a: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0063: Unknown result type (might be due to invalid IL or missing references)
+		//IL_008c: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0091: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00a8: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00c8: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00e8: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00f3: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00fa: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00ff: Unknown result type (might be due to invalid IL or missing references)
+		//IL_010a: Unknown result type (might be due to invalid IL or missing references)
+		//IL_011e: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0128: Expected O, but got Unknown
+		//IL_016b: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0150: Unknown result type (might be due to invalid IL or missing references)
+		RectTransform val = Rect(parent, name, x, y, w, h);
+		Image targetGraphic = Paint(val, accent ? new Color(0.81f, 0.51f, 0.14f, 1f) : new Color(0.13f, 0.15f, 0.17f, 1f), raycast: true);
+		Outline(val, accent ? Gold : Border, 1f);
+		Button obj = ((Component)val).gameObject.AddComponent<Button>();
+		((Selectable)obj).targetGraphic = (Graphic)(object)targetGraphic;
+		ColorBlock colors = ((Selectable)obj).colors;
+		((ColorBlock)(ref colors)).highlightedColor = new Color(1.17f, 1.17f, 1.17f, 1f);
+		((ColorBlock)(ref colors)).pressedColor = new Color(0.72f, 0.72f, 0.72f, 1f);
+		((ColorBlock)(ref colors)).disabledColor = new Color(0.6f, 0.6f, 0.6f, 0.65f);
+		((Selectable)obj).colors = colors;
+		Navigation navigation = ((Selectable)obj).navigation;
+		((Navigation)(ref navigation)).mode = (Mode)0;
+		((Selectable)obj).navigation = navigation;
+		((UnityEvent)obj.onClick).AddListener((UnityAction)delegate
+		{
+			callback();
+		});
+		Label((Transform)(object)val, "Label", text, 0f, 0f, w - 8f, h - 4f, size, (Color)(accent ? new Color(0.14f, 0.09f, 0.03f, 1f) : TextColor), (TextAnchor)4);
+		return obj;
+	}
+
+	private InputField Search(Transform parent, float x, float y, float w, float h)
+	{
+		//IL_0013: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0020: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0071: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00b3: Unknown result type (might be due to invalid IL or missing references)
+		RectTransform val = Rect(parent, "Search", x, y, w, h);
+		Image targetGraphic = Paint(val, Card, raycast: true);
+		Outline(val, Border, 1f);
+		InputField obj = ((Component)val).gameObject.AddComponent<InputField>();
+		((Selectable)obj).targetGraphic = (Graphic)(object)targetGraphic;
+		obj.characterLimit = 64;
+		Text val2 = Label((Transform)(object)val, "Text", "", 0f, 0f, w - 18f, h - 4f, 13, TextColor, (TextAnchor)3);
+		val2.horizontalOverflow = (HorizontalWrapMode)1;
+		obj.textComponent = val2;
+		Text placeholder = Label((Transform)(object)val, "Placeholder", "Поиск по названию или ID…", 0f, 0f, w - 18f, h - 4f, 12, Muted, (TextAnchor)3);
+		obj.placeholder = (Graphic)(object)placeholder;
+		obj.lineType = (LineType)0;
+		return obj;
+	}
+
+	private static ScrollRect Scroll(Transform parent, string name, float x, float y, float width, float height, out RectTransform content, Vector2 cell, int columns)
+	{
+		//IL_0022: Unknown result type (might be due to invalid IL or missing references)
+		//IL_002f: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0090: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00dc: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00f3: Unknown result type (might be due to invalid IL or missing references)
+		//IL_010a: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0117: Unknown result type (might be due to invalid IL or missing references)
+		//IL_012b: Unknown result type (might be due to invalid IL or missing references)
+		RectTransform obj = Rect(parent, name, x, y, width, height);
+		Paint(obj, new Color(0.035f, 0.044f, 0.054f, 1f), raycast: true);
+		Outline(obj, Border, 1f);
+		ScrollRect val = ((Component)obj).gameObject.AddComponent<ScrollRect>();
+		val.horizontal = false;
+		val.vertical = true;
+		val.movementType = (MovementType)2;
+		val.scrollSensitivity = 30f;
+		RectTransform val2 = Rect((Transform)(object)obj, "Viewport", 0f, 0f, width - 4f, height - 4f);
+		Paint(val2, Color.white, raycast: true);
+		((Component)val2).gameObject.AddComponent<Mask>().showMaskGraphic = false;
+		content = Rect((Transform)(object)val2, "Content", 0f, 0f, width - 4f, height);
+		content.anchorMin = new Vector2(0f, 1f);
+		content.anchorMax = new Vector2(1f, 1f);
+		content.pivot = new Vector2(0.5f, 1f);
+		content.anchoredPosition = Vector2.zero;
+		content.sizeDelta = new Vector2(0f, height);
+		val.viewport = val2;
+		val.content = content;
+		val.verticalNormalizedPosition = 1f;
+		return val;
+	}
+}
+public sealed class FrameGraphic : MaskableGraphic
+{
+	public float Thickness = 1f;
+
+	protected override void OnPopulateMesh(VertexHelper vh)
+	{
+		//IL_000c: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0011: Unknown result type (might be due to invalid IL or missing references)
+		vh.Clear();
+		Rect rect = ((Graphic)this).rectTransform.rect;
+		float thickness = Thickness;
+		Add(vh, ((Rect)(ref rect)).xMin, ((Rect)(ref rect)).yMax - thickness, ((Rect)(ref rect)).xMax, ((Rect)(ref rect)).yMax);
+		Add(vh, ((Rect)(ref rect)).xMin, ((Rect)(ref rect)).yMin, ((Rect)(ref rect)).xMax, ((Rect)(ref rect)).yMin + thickness);
+		Add(vh, ((Rect)(ref rect)).xMin, ((Rect)(ref rect)).yMin + thickness, ((Rect)(ref rect)).xMin + thickness, ((Rect)(ref rect)).yMax - thickness);
+		Add(vh, ((Rect)(ref rect)).xMax - thickness, ((Rect)(ref rect)).yMin + thickness, ((Rect)(ref rect)).xMax, ((Rect)(ref rect)).yMax - thickness);
+	}
+
+	private void Add(VertexHelper vh, float x0, float y0, float x1, float y1)
+	{
+		//IL_000a: Unknown result type (might be due to invalid IL or missing references)
+		//IL_000f: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0015: Unknown result type (might be due to invalid IL or missing references)
+		//IL_001a: Unknown result type (might be due to invalid IL or missing references)
+		//IL_001f: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0024: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0032: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0037: Unknown result type (might be due to invalid IL or missing references)
+		//IL_003d: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0042: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0047: Unknown result type (might be due to invalid IL or missing references)
+		//IL_004c: Unknown result type (might be due to invalid IL or missing references)
+		//IL_005b: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0060: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0066: Unknown result type (might be due to invalid IL or missing references)
+		//IL_006b: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0070: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0075: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0083: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0088: Unknown result type (might be due to invalid IL or missing references)
+		//IL_008e: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0093: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0098: Unknown result type (might be due to invalid IL or missing references)
+		//IL_009d: Unknown result type (might be due to invalid IL or missing references)
+		int currentVertCount = vh.currentVertCount;
+		vh.AddVert(Vector2.op_Implicit(new Vector2(x0, y0)), Color32.op_Implicit(((Graphic)this).color), Vector4.op_Implicit(Vector2.zero));
+		vh.AddVert(Vector2.op_Implicit(new Vector2(x0, y1)), Color32.op_Implicit(((Graphic)this).color), Vector4.op_Implicit(Vector2.zero));
+		vh.AddVert(Vector2.op_Implicit(new Vector2(x1, y1)), Color32.op_Implicit(((Graphic)this).color), Vector4.op_Implicit(Vector2.zero));
+		vh.AddVert(Vector2.op_Implicit(new Vector2(x1, y0)), Color32.op_Implicit(((Graphic)this).color), Vector4.op_Implicit(Vector2.zero));
+		vh.AddTriangle(currentVertCount, currentVertCount + 1, currentVertCount + 2);
+		vh.AddTriangle(currentVertCount, currentVertCount + 2, currentVertCount + 3);
+	}
+}
+public sealed class ItemTip : MonoBehaviour, IPointerEnterHandler, IEventSystemHandler, IPointerExitHandler
+{
+	public Action Enter;
+
+	public Action Exit;
+
+	public void OnPointerEnter(PointerEventData e)
+	{
+		if (Enter != null)
+		{
+			Enter();
+		}
+	}
+
+	public void OnPointerExit(PointerEventData e)
+	{
+		if (Exit != null)
+		{
+			Exit();
+		}
+	}
+}
+public sealed class WheelGraphic : MaskableGraphic
+{
+	private float chance;
+
+	private Color ticks = new Color(0.36f, 0.39f, 0.44f, 1f);
+
+	public void SetChance(float value)
+	{
+		if (Math.Abs(chance - value) > 1E-08f)
+		{
+			chance = Mathf.Clamp01(value);
+			((Graphic)this).SetVerticesDirty();
+		}
+	}
+
+	public void SetResult(bool won)
+	{
+		//IL_0033: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0018: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0038: Unknown result type (might be due to invalid IL or missing references)
+		ticks = (won ? new Color(0.4f, 0.85f, 0.56f, 1f) : new Color(0.78f, 0.3f, 0.22f, 1f));
+		((Graphic)this).SetVerticesDirty();
+	}
+
+	public void ClearResult()
+	{
+		//IL_0015: Unknown result type (might be due to invalid IL or missing references)
+		//IL_001a: Unknown result type (might be due to invalid IL or missing references)
+		ticks = new Color(0.36f, 0.39f, 0.44f, 1f);
+		((Graphic)this).SetVerticesDirty();
+	}
+
+	protected override void OnPopulateMesh(VertexHelper vh)
+	{
+		//IL_000c: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0011: Unknown result type (might be due to invalid IL or missing references)
+		//IL_001f: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0024: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0060: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00a6: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00df: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00e6: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00ee: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0104: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0109: Unknown result type (might be due to invalid IL or missing references)
+		//IL_010b: Unknown result type (might be due to invalid IL or missing references)
+		//IL_010e: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0124: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0129: Unknown result type (might be due to invalid IL or missing references)
+		//IL_012b: Unknown result type (might be due to invalid IL or missing references)
+		//IL_012e: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0138: Unknown result type (might be due to invalid IL or missing references)
+		//IL_013d: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0140: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0142: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0144: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0149: Unknown result type (might be due to invalid IL or missing references)
+		//IL_014b: Unknown result type (might be due to invalid IL or missing references)
+		//IL_014d: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0152: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0154: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0156: Unknown result type (might be due to invalid IL or missing references)
+		//IL_015b: Unknown result type (might be due to invalid IL or missing references)
+		//IL_015d: Unknown result type (might be due to invalid IL or missing references)
+		//IL_015f: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0165: Unknown result type (might be due to invalid IL or missing references)
+		vh.Clear();
+		Rect rect = ((Graphic)this).rectTransform.rect;
+		float width = ((Rect)(ref rect)).width;
+		rect = ((Graphic)this).rectTransform.rect;
+		float num = Mathf.Min(width, ((Rect)(ref rect)).height) / 2f;
+		Arc(vh, num * 0.62f, num * 0.82f, 360f, new Color(0.17f, 0.2f, 0.25f, 1f));
+		if (chance > 0f)
+		{
+			Arc(vh, num * 0.62f, num * 0.82f, chance * 360f, new Color(1f, 0.61f, 0.17f, 1f));
+		}
+		Vector2 val = default(Vector2);
+		for (int i = 0; i < 60; i++)
+		{
+			float num2 = (float)i * (float)Math.PI * 2f / 60f;
+			((Vector2)(ref val))..ctor(Mathf.Sin(num2), Mathf.Cos(num2));
+			Vector2 val2 = new Vector2(val.y, 0f - val.x) * ((i % 5 == 0) ? 1.5f : 1f);
+			Vector2 val3 = val * num * ((i % 5 == 0) ? 0.86f : 0.89f);
+			Vector2 val4 = val * num * 0.95f;
+			Quad(vh, val3 - val2, val3 + val2, val4 + val2, val4 - val2, ticks);
+		}
+	}
+
+	private static void Arc(VertexHelper vh, float inner, float outer, float degrees, Color tint)
+	{
+		//IL_005e: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0061: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0066: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0069: Unknown result type (might be due to invalid IL or missing references)
+		//IL_006e: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0071: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0076: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0079: Unknown result type (might be due to invalid IL or missing references)
+		//IL_007e: Unknown result type (might be due to invalid IL or missing references)
+		int num = Math.Max(1, (int)Math.Ceiling(degrees / 2f));
+		Vector2 val = default(Vector2);
+		Vector2 val2 = default(Vector2);
+		for (int i = 0; i < num; i++)
+		{
+			float num2 = degrees * (float)i / (float)num * ((float)Math.PI / 180f);
+			float num3 = degrees * (float)(i + 1) / (float)num * ((float)Math.PI / 180f);
+			((Vector2)(ref val))..ctor(Mathf.Sin(num2), Mathf.Cos(num2));
+			((Vector2)(ref val2))..ctor(Mathf.Sin(num3), Mathf.Cos(num3));
+			Quad(vh, val * inner, val * outer, val2 * outer, val2 * inner, tint);
+		}
+	}
+
+	private static void Quad(VertexHelper vh, Vector2 a, Vector2 b, Vector2 c, Vector2 d, Color tint)
+	{
+		//IL_0008: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0009: Unknown result type (might be due to invalid IL or missing references)
+		//IL_000e: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0010: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0015: Unknown result type (might be due to invalid IL or missing references)
+		//IL_001a: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0025: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0026: Unknown result type (might be due to invalid IL or missing references)
+		//IL_002b: Unknown result type (might be due to invalid IL or missing references)
+		//IL_002d: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0032: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0037: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0042: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0043: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0048: Unknown result type (might be due to invalid IL or missing references)
+		//IL_004a: Unknown result type (might be due to invalid IL or missing references)
+		//IL_004f: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0054: Unknown result type (might be due to invalid IL or missing references)
+		//IL_005f: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0061: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0066: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0068: Unknown result type (might be due to invalid IL or missing references)
+		//IL_006d: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0072: Unknown result type (might be due to invalid IL or missing references)
+		int currentVertCount = vh.currentVertCount;
+		vh.AddVert(Vector2.op_Implicit(a), Color32.op_Implicit(tint), Vector4.op_Implicit(Vector2.zero));
+		vh.AddVert(Vector2.op_Implicit(b), Color32.op_Implicit(tint), Vector4.op_Implicit(Vector2.zero));
+		vh.AddVert(Vector2.op_Implicit(c), Color32.op_Implicit(tint), Vector4.op_Implicit(Vector2.zero));
+		vh.AddVert(Vector2.op_Implicit(d), Color32.op_Implicit(tint), Vector4.op_Implicit(Vector2.zero));
+		vh.AddTriangle(currentVertCount, currentVertCount + 1, currentVertCount + 2);
+		vh.AddTriangle(currentVertCount, currentVertCount + 2, currentVertCount + 3);
+	}
+}
+public sealed class ArrowGraphic : MaskableGraphic
+{
+	protected override void OnPopulateMesh(VertexHelper vh)
+	{
+		//IL_000c: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0011: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0026: Unknown result type (might be due to invalid IL or missing references)
+		//IL_002b: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0041: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0046: Unknown result type (might be due to invalid IL or missing references)
+		//IL_004c: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0051: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0056: Unknown result type (might be due to invalid IL or missing references)
+		//IL_005b: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0069: Unknown result type (might be due to invalid IL or missing references)
+		//IL_006e: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0074: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0079: Unknown result type (might be due to invalid IL or missing references)
+		//IL_007e: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0083: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0092: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0097: Unknown result type (might be due to invalid IL or missing references)
+		//IL_009d: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00a2: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00a7: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00ac: Unknown result type (might be due to invalid IL or missing references)
+		vh.Clear();
+		Rect rect = ((Graphic)this).rectTransform.rect;
+		float num = ((Rect)(ref rect)).width / 2f;
+		rect = ((Graphic)this).rectTransform.rect;
+		float num2 = ((Rect)(ref rect)).height / 2f;
+		vh.AddVert(Vector2.op_Implicit(new Vector2(0f, num2)), Color32.op_Implicit(((Graphic)this).color), Vector4.op_Implicit(Vector2.zero));
+		vh.AddVert(Vector2.op_Implicit(new Vector2(num, 0f - num2)), Color32.op_Implicit(((Graphic)this).color), Vector4.op_Implicit(Vector2.zero));
+		vh.AddVert(Vector2.op_Implicit(new Vector2(0f - num, 0f - num2)), Color32.op_Implicit(((Graphic)this).color), Vector4.op_Implicit(Vector2.zero));
+		vh.AddTriangle(0, 1, 2);
+	}
+}
+public sealed class DiskGraphic : MaskableGraphic
+{
+	protected override void OnPopulateMesh(VertexHelper vh)
+	{
+		//IL_000c: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0011: Unknown result type (might be due to invalid IL or missing references)
+		//IL_001f: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0024: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0039: Unknown result type (might be due to invalid IL or missing references)
+		//IL_003e: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0044: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0049: Unknown result type (might be due to invalid IL or missing references)
+		//IL_004e: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0053: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0083: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0089: Unknown result type (might be due to invalid IL or missing references)
+		//IL_008e: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0094: Unknown result type (might be due to invalid IL or missing references)
+		//IL_0099: Unknown result type (might be due to invalid IL or missing references)
+		//IL_009e: Unknown result type (might be due to invalid IL or missing references)
+		//IL_00a3: Unknown result type (might be due to invalid IL or missing references)
+		vh.Clear();
+		Rect rect = ((Graphic)this).rectTransform.rect;
+		float width = ((Rect)(ref rect)).width;
+		rect = ((Graphic)this).rectTransform.rect;
+		float num = Mathf.Min(width, ((Rect)(ref rect)).height) / 2f;
+		vh.AddVert(Vector2.op_Implicit(Vector2.zero), Color32.op_Implicit(((Graphic)this).color), Vector4.op_Implicit(Vector2.zero));
+		for (int i = 0; i <= 64; i++)
+		{
+			float num2 = (float)i * (float)Math.PI * 2f / 64f;
+			vh.AddVert(Vector2.op_Implicit(new Vector2(Mathf.Cos(num2), Mathf.Sin(num2)) * num), Color32.op_Implicit(((Graphic)this).color), Vector4.op_Implicit(Vector2.zero));
+		}
+		for (int j = 1; j <= 64; j++)
+		{
+			vh.AddTriangle(0, j, j + 1);
+		}
+	}
+}
+public sealed class CatalogItem
+{
+	public string Id;
+
+	public GameObject Prefab;
+
+	public ItemData Template;
+
+	public double Value;
+
+	public string Reason;
+
+	private string localizedName;
+
+	public string Name => localizedName ?? (localizedName = ((Localization.instance == null) ? Id : Localization.instance.Localize(Template.m_shared.m_name)));
+}
+public sealed class ValueCatalog
+{
+	public readonly List<CatalogItem> Items = new List<CatalogItem>();
+
+	private readonly Dictionary<string, CatalogItem> byId = new Dictionary<string, CatalogItem>(StringComparer.Ordinal);
+
+	private Dictionary<string, double> prices;
+
+	private readonly Dictionary<string, Recipe> recipes = new Dictionary<string, Recipe>();
+
+	private readonly Dictionary<string, double> computed = new Dictionary<string, double>();
+
+	private readonly Dictionary<string, string> reasons = new Dictionary<string, string>();
+
+	private readonly string folder;
+
+	private readonly ManualLogSource log;
+
+	private readonly double markup;
+
+	private static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
+
+	public string PricePath => Path.Combine(folder, "ItemValues.json");
+
+	public ValueCatalog(string folder, double markup, ManualLogSource log)
+	{
+		this.folder = folder;
+		this.markup = markup;
+		this.log = log;
+	}
+
+	public void Build()
+	{
+		//IL_01b5: Unknown result type (might be due to invalid IL or missing references)
+		//IL_01c3: Unknown result type (might be due to invalid IL or missing references)
+		//IL_01ca: Invalid comparison between Unknown and I4
+		Items.Clear();
+		byId.Clear();
+		recipes.Clear();
+		computed.Clear();
+		reasons.Clear();
+		prices = Defaults();
+		Directory.CreateDirectory(folder);
+		if (File.Exists(PricePath))
+		{
+			foreach (KeyValuePair<string, double> item in JsonConvert.DeserializeObject<Dictionary<string, double>>(File.ReadAllText(PricePath)) ?? throw new InvalidDataException("ItemValues.json must contain an object of prefab IDs and prices."))
+			{
+				if (item.Value < 0.0 || double.IsInfinity(item.Value) || double.IsNaN(item.Value))
+				{
+					throw new InvalidDataException("Invalid price for " + item.Key);
+				}
+				prices[item.Key] = item.Value;
+			}
+		}
+		foreach (GameObject item2 in ObjectDB.instance.m_items)
+		{
+			if ((Object)(object)item2 == (Object)null)
+			{
+				continue;
+			}
+			ItemDrop component = item2.GetComponent<ItemDrop>();
+			if (!((Object)(object)component == (Object)null) && component.m_itemData != null)
+			{
+				ItemData itemData = component.m_itemData;
+				if (itemData.m_shared != null && !string.IsNullOrEmpty(itemData.m_shared.m_name) && itemData.m_shared.m_icons != null && itemData.m_shared.m_icons.Length != 0 && !((Object)(object)itemData.m_shared.m_icons[0] == (Object)null) && (int)itemData.m_shared.m_itemType != 0 && (int)itemData.m_shared.m_itemType != 10 && !byId.ContainsKey(((Object)item2).name))
+				{
+					CatalogItem catalogItem = new CatalogItem
+					{
+						Id = ((Object)item2).name,
+						Prefab = item2,
+						Template = itemData
+					};
+					byId.Add(catalogItem.Id, catalogItem);
+				}
+			}
+		}
+		foreach (Recipe recipe in ObjectDB.instance.m_recipes)
+		{
+			if (!((Object)(object)recipe == (Object)null) && recipe.m_enabled && !((Object)(object)recipe.m_item == (Object)null) && recipe.m_amount > 0)
+			{
+				string name = ((Object)((Component)recipe.m_item).gameObject).name;
+				if (!recipes.ContainsKey(name))
+				{
+					recipes[name] = recipe;
+				}
+			}
+		}
+		foreach (CatalogItem value in byId.Values)
+		{
+			value.Value = Math.Round(Resolve(value.Id, new HashSet<string>()), 4);
+			value.Reason = (reasons.ContainsKey(value.Id) ? reasons[value.Id] : "Configured value");
+			if (!prices.ContainsKey(value.Id))
+			{
+				prices[value.Id] = value.Value;
+			}
+			if (value.Value > 0.0)
+			{
+				Items.Add(value);
+			}
+		}
+		Items.Sort((CatalogItem a, CatalogItem b) => string.Compare(a.Name, b.Name, StringComparison.CurrentCultureIgnoreCase));
+		AtomicWrite(PricePath, JsonConvert.SerializeObject((object)prices.OrderBy((KeyValuePair<string, double> p) => p.Key).ToDictionary((KeyValuePair<string, double> p) => p.Key, (KeyValuePair<string, double> p) => p.Value), (Formatting)1));
+		ExportCsv();
+		log.LogInfo((object)("ItemUpgrader: valued " + Items.Count + " items; prices at " + PricePath));
+	}
+
+	public CatalogItem Find(string id)
+	{
+		if (id == null || !byId.TryGetValue(id, out var value) || !(value.Value > 0.0))
+		{
+			return null;
+		}
+		return value;
+	}
+
+	public CatalogItem Find(ItemData item)
+	{
+		if (item != null && !((Object)(object)item.m_dropPrefab == (Object)null))
+		{
+			return Find(((Object)item.m_dropPrefab).name);
+		}
+		return null;
+	}
+
+	public double StakeValue(ItemData item, int count)
+	{
+		CatalogItem catalogItem = Find(item);
+		if (catalogItem == null || count < 1)
+		{
+			return 0.0;
+		}
+		double num = catalogItem.Value;
+		if (recipes.TryGetValue(catalogItem.Id, out var value) && item.m_quality > 1)
+		{
+			for (int i = 2; i <= Math.Min(item.m_quality, 100); i++)
+			{
+				double num2 = IngredientCost(value, i, new HashSet<string>());
+				num += num2 * markup;
+			}
+		}
+		else if (item.m_quality > 1)
+		{
+			num *= 1.0 + 0.35 * (double)(Math.Min(item.m_quality, 100) - 1);
+		}
+		if (item.m_shared.m_useDurability)
+		{
+			float maxDurability = item.GetMaxDurability();
+			if (maxDurability > 0f)
+			{
+				num *= 0.25 + 0.75 * (double)Mathf.Clamp01(item.m_durability / maxDurability);
+			}
+		}
+		return num * (double)count;
+	}
+
+	private double Resolve(string id, HashSet<string> visiting)
+	{
+		if (prices.TryGetValue(id, out var value))
+		{
+			reasons[id] = "Assigned resource / configured value";
+			return value;
+		}
+		if (computed.TryGetValue(id, out value))
+		{
+			return value;
+		}
+		if (!visiting.Add(id))
+		{
+			return Fallback(id);
+		}
+		if (recipes.TryGetValue(id, out var value2))
+		{
+			double num = IngredientCost(value2, 1, visiting);
+			if (num > 0.0)
+			{
+				value = (num * markup + StationCost(value2)) / (double)Math.Max(1, value2.m_amount);
+				reasons[id] = "Recipe ingredients + " + ((markup - 1.0) * 100.0).ToString("0", Inv) + "% labor + station effort / recipe yield";
+			}
+			else
+			{
+				value = Fallback(id);
+				reasons[id] = "Estimated: item type, tier and statistics (no priced recipe)";
+			}
+		}
+		else
+		{
+			value = Fallback(id);
+			reasons[id] = "Estimated: item type, tier and statistics (no priced recipe)";
+		}
+		visiting.Remove(id);
+		computed[id] = value;
+		return value;
+	}
+
+	private double IngredientCost(Recipe recipe, int quality, HashSet<string> visiting)
+	{
+		double num = 0.0;
+		double num2 = double.MaxValue;
+		if (recipe.m_resources == null)
+		{
+			return 0.0;
+		}
+		Requirement[] resources = recipe.m_resources;
+		foreach (Requirement val in resources)
+		{
+			if (val == null || (Object)(object)val.m_resItem == (Object)null)
+			{
+				continue;
+			}
+			int amount = val.GetAmount(quality);
+			if (amount > 0)
+			{
+				double num3 = Resolve(((Object)((Component)val.m_resItem).gameObject).name, visiting) * (double)amount;
+				if (num3 > 0.0)
+				{
+					num2 = Math.Min(num2, num3);
+				}
+				num += num3;
+			}
+		}
+		if (!recipe.m_requireOnlyOneIngredient)
+		{
+			return num;
+		}
+		if (num2 != double.MaxValue)
+		{
+			return num2;
+		}
+		return 0.0;
+	}
+
+	private static double StationCost(Recipe recipe)
+	{
+		string text = (((Object)(object)recipe.m_craftingStation == (Object)null) ? "" : ((Object)((Component)recipe.m_craftingStation).gameObject).name.ToLowerInvariant());
+		double num = 2.0;
+		if (text.Contains("workbench"))
+		{
+			num = 5.0;
+		}
+		if (text.Contains("cauldron"))
+		{
+			num = 12.0;
+		}
+		if (text.Contains("forge"))
+		{
+			num = 25.0;
+		}
+		if (text.Contains("blackforge"))
+		{
+			num = 90.0;
+		}
+		if (text.Contains("mage"))
+		{
+			num = 110.0;
+		}
+		if (text.Contains("north") || text.Contains("ice"))
+		{
+			num = 180.0;
+		}
+		return num * (double)Math.Max(1, recipe.m_minStationLevel);
+	}
+
+	private double Fallback(string id)
+	{
+		if (!byId.TryGetValue(id, out var value))
+		{
+			return 10.0;
+		}
+		SharedData shared = value.Template.m_shared;
+		string name = id.ToLowerInvariant();
+		int num = Math.Max(1, Math.Min(8, shared.m_toolTier + 1));
+		string[][] array = new string[8][]
+		{
+			new string[4] { "flint", "leather", "rag", "wood" },
+			new string[4] { "bronze", "troll", "copper", "tin" },
+			new string[4] { "iron", "root", "draugr", "abomination" },
+			new string[5] { "silver", "wolf", "fenris", "mountain", "drake" },
+			new string[5] { "blackmetal", "padded", "lox", "fuling", "goblin" },
+			new string[7] { "carapace", "mist", "seeker", "eitr", "dvergr", "jotun", "jotunn" },
+			new string[8] { "ash", "flametal", "morgen", "asksvin", "volture", "charred", "fader", "dvergrash" },
+			new string[8] { "north", "frost", "glacier", "ice", "winter", "boreal", "jormun", "nidhogg" }
+		};
+		for (int i = 0; i < array.Length; i++)
+		{
+			if (array[i].Any((string k) => name.Contains(k)))
+			{
+				num = Math.Max(num, i + 1);
+			}
+		}
+		double num2 = (new double[8] { 1.0, 3.0, 7.0, 12.0, 20.0, 35.0, 60.0, 95.0 })[num - 1];
+		switch (((object)Unsafe.As<ItemType, ItemType>(ref shared.m_itemType)/*cast due to .constrained prefix*/).ToString())
+		{
+		case "Trophy":
+			return 80.0 * num2;
+		case "Fish":
+			return 18.0 * num2;
+		case "Consumable":
+			return Math.Max(8.0 * num2, (double)(shared.m_food + shared.m_foodStamina + 2f * shared.m_foodEitr) * 0.6 * (double)Math.Max(1f, shared.m_foodBurnTime / 1200f));
+		case "Ammo":
+		case "AmmoNonEquipable":
+			return Math.Max(1.0, 2.0 * num2);
+		case "Material":
+			return Math.Max(5.0 * num2, shared.m_value);
+		case "Trinket":
+			return 150.0 * num2;
+		case "Misc":
+			return Math.Max(25.0 * num2, shared.m_value);
+		case "Utility":
+			return Math.Max(150.0 * num2, shared.m_value);
+		default:
+			return Math.Max(75.0 * num2, shared.m_armor * 20f + shared.m_blockPower * 5f + ((DamageTypes)(ref shared.m_damages)).GetTotalDamage() * 8f);
+		}
+	}
+
+	private void ExportCsv()
+	{
+		StringBuilder stringBuilder = new StringBuilder("Prefab;Name;Value;Category;Basis\n");
+		foreach (CatalogItem item in Items.OrderBy((CatalogItem i) => i.Id))
+		{
+			stringBuilder.Append(Csv(item.Id)).Append(';').Append(Csv(item.Name))
+				.Append(';')
+				.Append(item.Value.ToString("0.####", Inv))
+				.Append(';')
+				.Append(Csv(((object)Unsafe.As<ItemType, ItemType>(ref item.Template.m_shared.m_itemType)/*cast due to .constrained prefix*/).ToString()))
+				.Append(';')
+				.Append(Csv(item.Reason))
+				.Append('\n');
+		}
+		AtomicWrite(Path.Combine(folder, "Catalog.csv"), stringBuilder.ToString());
+	}
+
+	private static string Csv(string s)
+	{
+		return "\"" + (s ?? "").Replace("\"", "\"\"") + "\"";
+	}
+
+	private static void AtomicWrite(string path, string content)
+	{
+		string text = path + ".tmp";
+		File.WriteAllText(text, content, new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
+		if (File.Exists(path))
+		{
+			File.Replace(text, path, null);
+		}
+		else
+		{
+			File.Move(text, path);
+		}
+	}
+
+	public static Dictionary<string, double> Defaults()
+	{
+		Dictionary<string, double> dictionary = new Dictionary<string, double>(StringComparer.Ordinal);
+		string[] array = "\nWood=1;Stone=2;Resin=2;Coal=3;FineWood=7;RoundLog=4;ElderBark=12;YggdrasilWood=30;Blackwood=55;\nSwordCheat=0;MaceCheat=0;SledgeCheat=0;\nFlint=5;LeatherScraps=7;DeerHide=12;BoneFragments=5;Feathers=6;GreydwarfEye=7;NeckTail=9;RawMeat=9;DeerMeat=12;BoarMeat=9;\nRaspberry=4;Blueberries=6;Cloudberry=12;Mushroom=5;MushroomYellow=12;Dandelion=3;Honey=10;BeechSeeds=3;BirchSeeds=10;FirCone=5;PineCone=5;\nAncientSeed=50;Amber=5;AmberPearl=10;Ruby=20;Coins=1;TrollHide=35;SurtlingCore=90;\nCopperOre=24;TinOre=28;Copper=38;Tin=42;Bronze=135;CopperScrap=36;ScrapIron=65;Iron=85;\nEntrails=24;Bloodbag=28;Guck=35;Chain=120;WitheredBone=65;Chitin=40;Ooze=18;Root=90;TurnipSeeds=22;Turnip=12;CarrotSeeds=12;Carrot=8;\nSilverOre=95;Silver=120;Obsidian=45;FreezeGland=55;WolfPelt=50;WolfFang=65;WolfMeat=30;Crystal=40;FenrisHair=90;FenrisClaw=130;DragonEgg=350;\nBlackMetalScrap=90;BlackMetal=115;Barley=18;BarleyFlour=28;Flax=22;LinenThread=36;LoxMeat=55;LoxPelt=80;Needle=45;Tar=60;Bilebag=400;SoftTissue=170;\nJotunPuffs=38;Magecap=45;Sap=55;Eitr=340;Carapace=80;Mandible=150;SeekerMeat=65;HareMeat=60;ScaleHide=75;BlackCore=450;DvergrKeyFragment=650;DvergrKey=6500;DvergrNeedle=500;\nFlametalOre=220;FlametalOreNew=220;Flametal=270;FlametalNew=270;Ashwood=55;CharredBone=80;SulfurStone=95;Sulfur=95;ProustitePowder=120;MorgenHeart=850;MorgenSinew=500;\nAsksvinHide=160;AsksvinTail=130;AsksvinMeat=125;VoltureMeat=95;VoltureEgg=120;VoltureFeather=95;CelestialFeather=950;BonemawSerpentTooth=300;BonemawSerpentMeat=180;\nSmokePuff=65;Fiddleheadfern=70;Vineberry=70;MoltenCore=1000;GemstoneRed=2300;GemstoneBlue=2300;GemstoneGreen=2300;DvergrKeyAshlands=4500;BellFragment=800;\nSerpentMeat=70;SerpentScale=100;Egg=120;ChickenMeat=30;RottenMeat=3;RoyalJelly=90;MechanicalSpring=500;\nYmirRemains=120;Thunderstone=50;FishingRod=350;FishingBait=2;Megingjord=950;HelmetDverger=620;Wishbone=850;CryptKey=750;BeltStrength=950;\nTrophyBoar=50;TrophyDeer=60;TrophyNeck=45;TrophyGreydwarf=60;TrophyGreydwarfBrute=100;TrophyGreydwarfShaman=100;TrophySkeleton=80;TrophySkeletonPoison=140;TrophyTroll=250;\nTrophySurtling=160;TrophyLeech=150;TrophyDraugr=150;TrophyDraugrElite=260;TrophyBlob=130;TrophyAbomination=450;TrophyWraith=320;\nTrophyWolf=250;TrophyHatchling=300;TrophyFenring=450;TrophyCultist=650;TrophySGolem=650;TrophySerpent=650;\nTrophyGoblin=320;TrophyGoblinBrute=800;TrophyGoblinShaman=650;TrophyDeathsquito=250;TrophyLox=650;TrophyGrowth=450;\nTrophySeeker=550;TrophySeekerBrute=1000;TrophyGjall=1200;TrophyHare=400;TrophyDvergr=700;\nTrophyMorgen=1800;TrophyAsksvin=1100;TrophyVolture=900;TrophyCharredMelee=850;TrophyCharredArcher=850;TrophyCharredMage=1200;TrophyBonemawSerpent=1700;TrophyFallenValkyrie=2600;\nTrophyEikthyr=600;TrophyTheElder=1500;TrophyBonemass=3000;TrophyDragonQueen=5000;TrophyGoblinKing=8000;TrophySeekerQueen=14000;TrophyFader=24000;\nFish1=16;Fish2=24;Fish3=32;Fish4_cave=90;Fish5=80;Fish6=65;Fish7=85;Fish8=75;Fish9=150;Fish10=180;Fish11=200;Fish12=120;\nFishRaw=14;FishingBaitForest=12;FishingBaitSwamp=20;FishingBaitMountain=30;FishingBaitPlains=35;FishingBaitMistlands=55;FishingBaitOcean=45;FishingBaitAshlands=75;FishingBaitDeepNorth=90;\nAcorn=12;FulingTotem=600;GoblinTotem=600;TornSpirit=2000;QueenDrop=6000;FaderDrop=10000;EikthyrDrop=180;HardAntler=180;DragonTear=1000;\nBushSeeds=6;VineberrySeeds=110;AsksvinEgg=450;AsksvinEggWarm=450;BogWitchKvastur=500;BogWitchRat=100;\n".Split(new char[3] { ';', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
+		for (int i = 0; i < array.Length; i++)
+		{
+			string[] array2 = array[i].Trim().Split('=');
+			if (array2.Length == 2)
+			{
+				dictionary[array2[0].Trim()] = double.Parse(array2[1], Inv);
+			}
+		}
+		return dictionary;
+	}
+}
